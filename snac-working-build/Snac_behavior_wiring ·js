@@ -1,0 +1,428 @@
+import { snacInputFromScreenState }               from './snac_input_schema.js';
+import { resolveInputs }                           from './snac_inference_engine.js';
+import { scoreWeatherPriors }                      from './Snac_weather_priors.js';
+import { applyHuntingPressure }                    from './Snac_hunting_pressure.js';
+import { fuseSignals, flattenForEvaluators }       from './snac_sensor_fusion.js';
+import { buildConfidenceLayers, buildPrePassFlags } from './snac_confidence_layers.js';
+import {
+  runSnacFullAnalysis,
+  buildSnacDecisionOutput,
+  buildSnacFieldSummary,
+} from './snac_master_deduped.js';
+
+// =============================================================================
+// SNAC Field Intelligence - Phase 3.8
+// 
+// Full Phase 3 orchestration + Phase 2 wiring
+// =============================================================================
+//
+// PURPOSE:
+// This is the single entry point that replaces direct calls to
+// runSnacFullAnalysis. It runs the complete Phase 3 enrichment chain
+// on every track in a session, then feeds enriched inputs to Phase 2.
+//
+// CHAIN:
+//   screenState[]  (one per logged track in session)
+//       |
+//       v  snacInputFromScreenState()       [3.2] - lock data contract
+//       v  resolveInputs()                  [3.3] - fill missing from species profile
+//       v  scoreWeatherPriors()             [3.4] - async, Open-Meteo or UI fallback
+//       v  applyHuntingPressure()           [3.5] - pressure shifts and morning gate
+//       v  fuseSignals()                    [3.6] - conflict resolution
+//       v  buildPrePassFlags()              [3.7] - quality flags for evaluators
+//       v  buildSensorDetection()           [3.8] - translate to Phase 2 shape
+//       |
+//       v  runSnacFullAnalysis()            [Phase 2 - unchanged]
+//       |
+//       v  buildConfidenceLayers()          [3.7 post-pass] - 4 layer split
+//       |
+//       v  enriched result object
+//
+// MULTI-TRACK:
+//   Each track in sessionTracks is independently enriched through Phase 3.
+//   All enriched tracks are passed together to Phase 2 as sensorDetections[].
+//   Phase 2 evaluators then see the full session pattern, not isolated tracks.
+//   Environment and time context are taken from the most recent track.
+//
+// =============================================================================
+
+// =============================================================================
+// TRANSLATE fused context -> Phase 2 sensorDetection shape
+// =============================================================================
+// Phase 2 normalizeTrackDetection expects:
+//   classifications[]   - species candidates with confidence
+//   geometry{}          - stride, pace, heading, coords
+//   vision_metrics{}    - edge_clarity, freshness, depth etc
+//   behavior_hints{}    - gait, behavior, track_substrate
+//   id, source, timestamp
+
+function buildSensorDetection(fusedContext, flatInputs, trackIndex, screenState) {
+  const speciesKey  = fusedContext.species?.species ?? null;
+  const probList    = fusedContext.species?.species_probability_list ?? [];
+
+  // Build classifications from probability list
+  // If no list, fall back to declared species at declared confidence
+  let classifications = [];
+  if (probList.length > 0) {
+    classifications = probList.map(p => ({
+      species:    p.species_key,
+      confidence: (p.probability ?? 0) / 100,
+    }));
+  } else if (speciesKey) {
+    classifications = [{
+      species:    speciesKey,
+      confidence: flatInputs.confidence ?? 0.5,
+    }];
+  }
+
+  // Geometry from fused context
+  const geometry = {
+    stride_length_m: fusedContext.gait?.stride_m ?? null,
+    lat:             screenState.harvestGps?.latitude  ?? null,
+    lon:             screenState.harvestGps?.longitude ?? null,
+    heading_deg:     null, // populated by session memory in 3.9
+  };
+
+  // Vision metrics - edge clarity and freshness are the key inputs
+  // Depth score inferred from substrate + heavy animal flag
+  const isHeavy    = fusedContext.substrate?.decay_multiplier
+    ? fusedContext.substrate.decay_multiplier < 1.5 && speciesKey
+    : false;
+  const vision_metrics = {
+    freshness_score:       fusedContext.freshness?.freshness_raw ?? screenState.freshness ?? null,
+    edge_clarity:          screenState.edgeClarity ?? null,
+    depth_score:           isHeavy ? 0.80 : null, // heavy animals leave deep tracks
+    moisture_score:        fusedContext.substrate?.is_wet ? 0.75 : 0.25,
+    weather_exposure_score: fusedContext.freshness?.age_hours_mid
+      ? Math.min(1, fusedContext.freshness.age_hours_mid / 72) // degrades over 72h
+      : null,
+  };
+
+  // Behavior hints - gait, behavior, substrate
+  const behavior_hints = {
+    gait:            fusedContext.gait?.gait            ?? screenState.gait      ?? null,
+    behavior:        screenState.behavior               ?? null,
+    track_substrate: fusedContext.substrate?.substrate  ?? screenState.substrate ?? null,
+    freshness_score: vision_metrics.freshness_score,
+  };
+
+  return {
+    id:             'track_' + (trackIndex + 1) + '_' + (screenState._timestamp ?? Date.now()),
+    classifications,
+    geometry,
+    vision_metrics,
+    behavior_hints,
+    source:         'manual_phase3',
+    timestamp:      screenState._timestamp ?? Date.now(),
+    // Phase 3 enrichment data attached for confidence layers
+    _phase3: {
+      fusedContext,
+      flatInputs,
+      speciesKey,
+    },
+  };
+}
+
+// =============================================================================
+// BUILD rawEnvironment for Phase 2 from most recent track's fused context
+// =============================================================================
+// Environment is session-level - same area, same conditions
+// Taken from the last logged track as most current
+
+function buildRawEnvironment(fusedContext, screenState) {
+  return {
+    near_water:        fusedContext.near_water          ?? screenState.nearWater   ?? false,
+    on_ridge:          fusedContext.on_ridge            ?? screenState.onRidge     ?? false,
+    dense_cover:       fusedContext.dense_cover         ?? screenState.denseCover  ?? false,
+    zone_tags:         screenState.zoneTag
+      ? [screenState.zoneTag, ...(screenState.signTags ?? [])]
+      : [...(screenState.signTags ?? [])],
+    light_phase:       fusedContext.light_phase         ?? screenState.lightPhase  ?? null,
+    weather_code:      screenState.weatherCode          ?? null,
+    air_temperature_c: fusedContext.movement?.weather_movement_score
+      ? null  // temperature embedded in weather result
+      : null,
+    substrate_hint:    fusedContext.substrate?.substrate ?? screenState.substrate ?? null,
+  };
+}
+
+// =============================================================================
+// BUILD rawTimeContext for Phase 2
+// =============================================================================
+
+function buildRawTimeContext(fusedContext, screenState) {
+  return {
+    local_hour:  fusedContext.local_hour ?? new Date().getHours(),
+    light_phase: fusedContext.light_phase ?? screenState.lightPhase ?? null,
+    timestamp:   screenState._timestamp ?? Date.now(),
+  };
+}
+
+// =============================================================================
+// ENRICH ONE TRACK through Phase 3 chain
+// =============================================================================
+// Returns { fusedContext, flatInputs, prePassFlags, weatherResult, pressureResult }
+
+async function enrichTrack(screenState, profiles, gpsCoords, huntingPressure) {
+  // 3.2 - Lock data contract
+  const schemaInput = snacInputFromScreenState(screenState);
+
+  // 3.3 - Fill missing from species profile
+  const resolved = resolveInputs(schemaInput, profiles);
+
+  // 3.4 - Score weather conditions (async - hits Open-Meteo or uses UI fallback)
+  const weatherResult = await scoreWeatherPriors(resolved, gpsCoords, null);
+
+  // 3.5 - Apply hunting pressure
+  const speciesKey = resolved.species?.value ?? null;
+  const localHour  = resolved.local_hour?.value ?? new Date().getHours();
+  const month      = new Date().getMonth() + 1;
+
+  const correctedFreshness = resolved.decay_correction?.corrected_freshness
+    ?? resolved.freshness?.value
+    ?? null;
+
+  const pressureResult = applyHuntingPressure({
+    activityPrior:     resolved.activity_prior     ?? null,
+    weatherPrior:      weatherResult,
+    huntingPressure:   huntingPressure ?? 'none',
+    speciesKey,
+    correctedFreshness,
+    localHour,
+    month,
+  });
+
+  // 3.6 - Resolve conflicts
+  const fusedContext = fuseSignals(resolved, weatherResult, pressureResult);
+
+  // 3.7 pre-pass - Quality flags for evaluators
+  const prePassFlags = buildPrePassFlags(fusedContext);
+
+  // Flatten for evaluators
+  const flatInputs = flattenForEvaluators(fusedContext);
+
+  return {
+    fusedContext,
+    flatInputs,
+    prePassFlags,
+    weatherResult,
+    pressureResult,
+    resolved,
+  };
+}
+
+// =============================================================================
+// MAIN EXPORT: runSnacWithPhase3
+// =============================================================================
+//
+// Parameters:
+//   currentScreenState  - current UI state object from SnacScreen
+//   sessionTracks       - array of previously logged screen states this session
+//                         each entry should have _timestamp set when ADD TRACK was pressed
+//   huntingPressure     - 'none' | 'light' | 'moderate' | 'heavy'
+//   profiles            - species profiles object from getProfiles()
+//   gpsCoords           - { lat, lon } or null
+//
+// Returns:
+//   {
+//     summary,           - Phase 2 field summary
+//     decision,          - Phase 2 decision output
+//     confidenceLayers,  - 4 independent confidence layers (3.7)
+//     probabilityList,   - ranked species candidates with %
+//     fusionSummary,     - conflict and warning summary
+//     prePassFlags,      - data quality flags
+//     sessionTrackCount, - how many tracks were in this analysis
+//     raw,               - full Phase 2 output
+//     phase3,            - full Phase 3 enrichment data for debugging
+//     valid,             - boolean
+//     error,             - string or null
+//   }
+
+export async function runSnacWithPhase3({
+  currentScreenState = {},
+  sessionTracks      = [],
+  huntingPressure    = 'none',
+  profiles           = {},
+  gpsCoords          = null,
+} = {}) {
+
+  // All tracks to analyse = session tracks + current screen state
+  // Current screen state is always included as the final track
+  const currentWithTimestamp = {
+    ...currentScreenState,
+    _timestamp: Date.now(),
+  };
+
+  const allScreenStates = [
+    ...sessionTracks,
+    currentWithTimestamp,
+  ];
+
+  if (allScreenStates.length === 0) {
+    return {
+      valid: false,
+      error: 'No track data provided',
+      summary: null,
+      decision: null,
+      confidenceLayers: null,
+      probabilityList: [],
+      fusionSummary: null,
+      prePassFlags: null,
+      sessionTrackCount: 0,
+      raw: null,
+      phase3: null,
+    };
+  }
+
+  try {
+    // Enrich all tracks through Phase 3 chain concurrently
+    // Weather fetch is async - all tracks share the same weather result
+    // to avoid hammering the API on multi-track sessions
+    // We fetch once from the first track then reuse
+
+    // First track enrichment (includes weather fetch)
+    const firstEnriched = await enrichTrack(
+      allScreenStates[0],
+      profiles,
+      gpsCoords,
+      huntingPressure
+    );
+
+    // Remaining tracks reuse weather result, skip the fetch
+    const remainingEnriched = await Promise.all(
+      allScreenStates.slice(1).map(ss =>
+        enrichTrack(ss, profiles, null, huntingPressure).then(e => ({
+          ...e,
+          // Override weather with the already-fetched result
+          weatherResult:   firstEnriched.weatherResult,
+          pressureResult:  applyHuntingPressure({
+            activityPrior:    e.resolved.activity_prior ?? null,
+            weatherPrior:     firstEnriched.weatherResult,
+            huntingPressure:  huntingPressure ?? 'none',
+            speciesKey:       e.resolved.species?.value ?? null,
+            correctedFreshness: e.resolved.decay_correction?.corrected_freshness
+              ?? e.resolved.freshness?.value ?? null,
+            localHour: e.resolved.local_hour?.value ?? new Date().getHours(),
+            month:     new Date().getMonth() + 1,
+          }),
+        }))
+      )
+    );
+
+    const allEnriched = [firstEnriched, ...remainingEnriched];
+
+    // Re-fuse remaining tracks with shared weather
+    const allFused = allEnriched.map((e, i) =>
+      i === 0
+        ? e
+        : {
+            ...e,
+            fusedContext: fuseSignals(e.resolved, firstEnriched.weatherResult, e.pressureResult),
+          }
+    );
+
+    // Build sensorDetections array for Phase 2
+    const sensorDetections = allFused.map((e, i) =>
+      buildSensorDetection(
+        e.fusedContext,
+        e.flatInputs,
+        i,
+        allScreenStates[i]
+      )
+    );
+
+    // Use most recent track for environment and time context
+    const lastFused      = allFused[allFused.length - 1];
+    const lastScreenState = allScreenStates[allScreenStates.length - 1];
+
+    const rawEnvironment = buildRawEnvironment(lastFused.fusedContext, lastScreenState);
+    const rawTimeContext = buildRawTimeContext(lastFused.fusedContext, lastScreenState);
+
+    // Run Phase 2 with enriched multi-track input
+    const fullResult = runSnacFullAnalysis({
+      sensorDetections,
+      rawEnvironment,
+      rawTimeContext,
+      speciesProfiles: profiles,
+    });
+
+    const fieldSummary = buildSnacFieldSummary(fullResult);
+    const decisionOut  = buildSnacDecisionOutput(fullResult);
+
+    // 3.7 post-pass - Build 4 confidence layers using last track fused context
+    // Last track is most current and most relevant
+    const confidenceLayers = buildConfidenceLayers(
+      lastFused.fusedContext,
+      decisionOut,
+      profiles
+    );
+
+    return {
+      valid:             true,
+      error:             null,
+      summary:           fieldSummary,
+      decision:          decisionOut,
+      confidenceLayers,
+      probabilityList:   confidenceLayers.summary.species_probability_list ?? [],
+      fusionSummary:     lastFused.fusedContext.fusion_meta ?? null,
+      prePassFlags:      lastFused.prePassFlags,
+      sessionTrackCount: allScreenStates.length,
+      raw:               fullResult,
+      phase3: {
+        enrichedTracks:  allFused.map(e => ({
+          fusedContext:  e.fusedContext,
+          prePassFlags:  e.prePassFlags,
+          weatherResult: e.weatherResult,
+        })),
+        huntingPressure,
+        gpsUsed: !!gpsCoords,
+      },
+    };
+
+  } catch (err) {
+    return {
+      valid:             false,
+      error:             err?.message ?? 'Phase 3 wiring error',
+      summary:           null,
+      decision:          null,
+      confidenceLayers:  null,
+      probabilityList:   [],
+      fusionSummary:     null,
+      prePassFlags:      null,
+      sessionTrackCount: allScreenStates.length,
+      raw:               null,
+      phase3:            null,
+    };
+  }
+}
+
+// =============================================================================
+// CONVENIENCE: build a minimal screen state for testing
+// =============================================================================
+
+export function makeTestScreenState(overrides = {}) {
+  return {
+    speciesOverride:  null,
+    speciesKnown:     false,
+    confidence:       0.80,
+    freshness:        0.70,
+    edgeClarity:      0.70,
+    strideM:          '',
+    nearWater:        false,
+    onRidge:          false,
+    denseCover:       false,
+    zoneTag:          '',
+    lightPhase:       '',
+    weatherCode:      '',
+    gait:             '',
+    substrate:        '',
+    behavior:         '',
+    signTags:         [],
+    fieldNotes:       '',
+    photoUri:         null,
+    harvestGps:       null,
+    harvestTimestamp: null,
+    _timestamp:       Date.now(),
+    ...overrides,
+  };
+}
