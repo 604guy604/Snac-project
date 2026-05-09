@@ -31,6 +31,7 @@ import { applyHuntingPressure } from './Snac_hunting_pressure.js';
 import { scoreWeatherPriors } from './Snac_weather_priors.js';
 import { analyzeSession, getSessionSummaryLine } from './snac_session_memory.js';
 import { scoreHabitatPlausibility, getBiome } from './snac_habitat_gps.js';
+import { analyzeTrackPhoto } from './visionService.js';
 
 // =============================================================================
 // MODULE-LEVEL SINGLETON STORE
@@ -50,6 +51,7 @@ const _store = {
   sessionMemory:  null,   // Phase 3.9 - output of analyzeSession()
   inputState:     {},
   photoUri:       null,
+  photoAnalysis:  null,
 };
 
 // Simple listener registry - components subscribe/unsubscribe on mount/unmount
@@ -259,6 +261,26 @@ function _addTrack(screenState) {
   return { snapshot, sessionMemory: mem };
 }
 
+async function _analyzePhoto(uri) {
+  if (!uri) {
+    _set({ photoAnalysis: null });
+    return null;
+  }
+
+  _set({ loading: true, error: null });
+  try {
+    const result = await analyzeTrackPhoto(uri);
+    _set({ photoAnalysis: result });
+    return result;
+  } catch (err) {
+    const message = err?.message ?? 'Vision analysis failed';
+    _set({ error: message });
+    throw err;
+  } finally {
+    _set({ loading: false });
+  }
+}
+
 function _clearSession() {
   _set({
     sessionTracks:    [],
@@ -370,7 +392,11 @@ export function useSnac() {
   }, []);
 
   const setPhotoUri = useCallback((uri) => {
-    _set({ photoUri: uri });
+    _set({ photoUri: uri, photoAnalysis: null });
+  }, []);
+
+  const analyzePhoto = useCallback(async (uri) => {
+    return _analyzePhoto(uri);
   }, []);
 
   const reset = useCallback(() => {
@@ -413,6 +439,8 @@ export function useSnac() {
     // Shared photo (synced from CameraScreen)
     photoUri:         state.photoUri,
     setPhotoUri,
+    photoAnalysis:    state.photoAnalysis,
+    analyzePhoto,
   };
 }
 

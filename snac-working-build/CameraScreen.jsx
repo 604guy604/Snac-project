@@ -1,4 +1,4 @@
-import React, { useCallback } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   Platform, Alert, Image
@@ -9,7 +9,22 @@ import { useSnac } from './useSnac.js';
 const MONO = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
 
 export default function CameraScreen() {
-  const { photoUri, setPhotoUri } = useSnac();
+  const { photoUri, photoAnalysis, analyzePhoto, setPhotoUri } = useSnac();
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [localAnalysisError, setLocalAnalysisError] = useState(null);
+
+  const handleAnalyze = useCallback(async () => {
+    if (!photoUri) return;
+    setLocalAnalysisError(null);
+    setIsAnalyzing(true);
+    try {
+      await analyzePhoto(photoUri);
+    } catch (err) {
+      setLocalAnalysisError(err?.message ?? 'Analysis failed');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }, [analyzePhoto, photoUri]);
 
   const handleCapture = useCallback(async () => {
     const { status } = await ImagePicker.requestCameraPermissionsAsync();
@@ -57,9 +72,39 @@ export default function CameraScreen() {
             <View style={st.previewActions}>
               <Text style={st.previewLabel}>PHOTO LOADED</Text>
               <Text style={st.previewSub}>Photo will feed the engine on analysis</Text>
-              <TouchableOpacity style={st.clearBtn} onPress={() => setPhotoUri(null)}>
-                <Text style={st.clearBtnTxt}>CLEAR PHOTO</Text>
-              </TouchableOpacity>
+              <View style={st.previewActionRow}>
+                <TouchableOpacity style={st.analyzeBtn} onPress={handleAnalyze} disabled={isAnalyzing}>
+                  <Text style={st.analyzeBtnTxt}>{isAnalyzing ? 'ANALYZING...' : 'ANALYZE PHOTO'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={st.clearBtn} onPress={() => setPhotoUri(null)}>
+                  <Text style={st.clearBtnTxt}>CLEAR PHOTO</Text>
+                </TouchableOpacity>
+              </View>
+              {localAnalysisError ? (
+                <Text style={st.analysisError}>{localAnalysisError}</Text>
+              ) : null}
+              {photoAnalysis ? (
+                <View style={st.analysisCard}>
+                  <Text style={st.analysisTitle}>Vision status</Text>
+                  <Text style={st.analysisMessage}>{photoAnalysis.message ?? 'No analysis details available.'}</Text>
+                  {Array.isArray(photoAnalysis.candidates) && photoAnalysis.candidates.length > 0 ? (
+                    <View style={st.analysisList}>
+                      {photoAnalysis.candidates.map((candidate, index) => (
+                        <Text key={index} style={st.analysisItem}>
+                          {candidate.species ?? candidate.label ?? 'Unknown'}
+                          {candidate.confidence != null ? ` · ${Math.round((candidate.confidence ?? 0) * 100)}%` : ''}
+                        </Text>
+                      ))}
+                    </View>
+                  ) : (
+                    <Text style={st.analysisNote}>
+                      {photoAnalysis.status === 'unavailable'
+                        ? 'Vision backend not configured. Add EXPO_PUBLIC_VISION_API_URL and connect the backend.'
+                        : 'No candidates returned yet.'}
+                    </Text>
+                  )}
+                </View>
+              ) : null}
             </View>
           </>
         ) : (
@@ -126,8 +171,18 @@ const st = StyleSheet.create({
   previewActions: { alignItems: 'center' },
   previewLabel:   { fontFamily: MONO, fontSize: 13, letterSpacing: 4, color: '#4EFF6E', fontWeight: '700', marginBottom: 4 },
   previewSub:     { fontFamily: MONO, fontSize: 9, letterSpacing: 2, color: '#7A917C', marginBottom: 16 },
-  clearBtn:       { borderWidth: 1, borderColor: '#1C211D', borderRadius: 3, paddingHorizontal: 20, paddingVertical: 10 },
+  previewActionRow: { flexDirection: 'row', justifyContent: 'space-between', width: '100%', marginBottom: 12 },
+  analyzeBtn:     { flex: 1, borderWidth: 1.5, borderColor: '#C8A84B', borderRadius: 4, paddingVertical: 14, alignItems: 'center', backgroundColor: '#C8A84B11', marginRight: 8 },
+  analyzeBtnTxt:  { fontFamily: MONO, fontSize: 10, letterSpacing: 3, color: '#C8A84B', fontWeight: '700' },
+  clearBtn:       { flex: 1, borderWidth: 1, borderColor: '#1C211D', borderRadius: 3, paddingHorizontal: 20, paddingVertical: 10, alignItems: 'center', marginLeft: 8 },
   clearBtnTxt:    { fontFamily: MONO, fontSize: 10, letterSpacing: 3, color: '#7A917C' },
+  analysisError:  { fontFamily: MONO, fontSize: 9, letterSpacing: 1.5, color: '#FF6767', marginTop: 8 },
+  analysisCard:   { width: '100%', backgroundColor: '#111513', borderRadius: 4, borderWidth: 1, borderColor: '#283B27', padding: 12, marginTop: 12 },
+  analysisTitle:  { fontFamily: MONO, fontSize: 10, letterSpacing: 4, color: '#C8A84B', fontWeight: '700', marginBottom: 6 },
+  analysisMessage:{ fontFamily: MONO, fontSize: 9, letterSpacing: 1, color: '#7A917C', marginBottom: 8 },
+  analysisList:   { borderTopWidth: 1, borderTopColor: '#1C211D', paddingTop: 8 },
+  analysisItem:   { fontFamily: MONO, fontSize: 9, letterSpacing: 1.5, color: '#4EFF6E', marginBottom: 4 },
+  analysisNote:   { fontFamily: MONO, fontSize: 8, letterSpacing: 1, color: '#1C211D', marginTop: 6 },
   visionPlaceholder: { borderWidth: 1, borderColor: '#1C211D', borderRadius: 4, padding: 16, marginTop: 'auto' },
   visionLabel:    { fontFamily: MONO, fontSize: 10, letterSpacing: 4, color: '#256B35', fontWeight: '700', marginBottom: 4 },
   visionSub:      { fontFamily: MONO, fontSize: 9, letterSpacing: 2, color: '#3A4A3C', marginBottom: 8 },
