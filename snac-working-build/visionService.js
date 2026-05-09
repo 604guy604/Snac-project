@@ -27,7 +27,7 @@ export async function analyzeTrackPhoto(uri) {
   const formData = new FormData();
   formData.append('photo', getFileInfo(uri));
 
-  const response = await fetch(VISION_API_URL, {
+  const response = await fetch(`${VISION_API_URL}/analyze-image`, {
     method: 'POST',
     body: formData,
   });
@@ -40,7 +40,7 @@ export async function analyzeTrackPhoto(uri) {
   return {
     status: 'success',
     message: result.message ?? 'Vision analysis complete',
-    candidates: Array.isArray(result.candidates) ? result.candidates : [],
+    candidates: Array.isArray(result.species_candidates) ? result.species_candidates : [],
     raw: result,
   };
 }

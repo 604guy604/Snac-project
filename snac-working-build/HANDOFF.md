@@ -133,7 +133,7 @@ App.js uses a custom vertical right-side tab bar (pure React Native, no navigati
 - useSnac.js - SINGLETON shared state pattern (module-level store, not per-component hook)
   Phase 3 full chain orchestration, session tracks, inputState shared across all screens
 - snac_units.js - Metric/imperial conversion, useUnits() hook, persists to SQLite
-  formatAdaptedTrackSize now outputs "Front Xcm  Rear Xcm" (not F/R)
+  formatAdaptedTrackSize now outputs "Front Xcm Rear Xcm" (not F/R)
 
 ---
 
@@ -207,12 +207,12 @@ Pulls data live from getProfiles() - no duplication.
 125 species grouped, searchable by common name, scientific name, or key.
 
 Real profile field paths (CRITICAL - adapter output shape):
-- terrain    → profile.behavior_research.primary_habitat (array)
-- diet       → profile.diet (comma string or array)
-- water      → profile.water_needs_l_per_day (number, via convertWater())
+- terrain → profile.behavior_research.primary_habitat (array)
+- diet → profile.diet (comma string or array)
+- water → profile.water_needs_l_per_day (number, via convertWater())
                fallback → profile.water_needs (string description)
-- predators  → profile.predator_of (array, top level)
-- prey       → profile.prey_of (array, top level)
+- predators → profile.predator_of (array, top level)
+- prey → profile.prey_of (array, top level)
 - track size → profile.track_size_cm { front, hind } via formatAdaptedTrackSize()
 
 Detail view shows:
@@ -254,7 +254,7 @@ Detail view shows:
 - SpeciesScreen: diet handles both comma string and array formats via toArray() helper
 - SpeciesScreen: predator/prey uses profile.predator_of / profile.prey_of (top level arrays)
 - SpeciesScreen: useUnits() destructured correctly as { system: units }
-- SpeciesScreen: track size displays "Front Xcm  Rear Xcm" (was "F / R")
+- SpeciesScreen: track size displays "Front Xcm Rear Xcm" (was "F / R")
 - InputsScreen: NEAR WATER / RIDGE / DENSE COVER toggles now spaced correctly (flex:1 per item)
 - InputsScreen: toggle labels wrap with \n to prevent cramping on narrow screens
 - App.js: SafeAreaView deprecation warning fixed - insets applied via useSafeAreaInsets() on root View
@@ -302,11 +302,13 @@ Accepts photo, runs YOLO inference, returns species candidates with confidence s
 This is the bridge between the phone and the model.
 FastAPI server already scaffolded and confirmed live with health endpoint.
 
-**4.2 - Load YOLO Weights**
+**4.2 - Load YOLO Weights ✅ COMPLETE**
 Pull risashinoda/footprint_yolo weights from HuggingFace.
 Load YOLOv11 into the endpoint.
 Confirm inference runs on a test image before any fine-tuning.
 Prove the pipeline exists before optimizing it.
+YOLO model loaded via ultralytics, integrated into /analyze-image endpoint.
+Returns real detections with confidence scores, mapped to SNAC species format.
 
 **4.3 - Connect CameraScreen**
 Wire CameraScreen to hit /analyze-image endpoint.
@@ -425,9 +427,32 @@ When Adam gets a proper machine: VS Code, then EAS build, then Phase 4 vision la
 
 1. Download the Snack zip from snack.expo.dev/@604appworks/snac-working-build
 2. Upload the zip and this handoff document to a fresh Claude conversation
-3. Paste the prompt from the continuation section above
+3. Paste the prompt below
 
 ---
+PROMPT TO PASTE:
 
+I am continuing development of SNAC Field Intelligence, a React Native wildlife behavioral
+inference engine running in Expo Snack at snack.expo.dev/@604appworks/snac-working-build on SDK 54.
+I am uploading the full project handoff document and the current Snack zip.
+
+The app has a working 4-tab vertical navigation (INPUTS/CAM/WORK/LIB) running on device.
+Phase 3 is complete (3.1-3.10 all wired and tested). Phase 4 vision layer is planned and
+documented in the handoff - requires Python backend and proper machine.
+
+CRITICAL: Do NOT use @react-navigation/native-stack - crashes Expo Go SDK 54.
+Navigation uses local state only. useSnac.js uses a singleton pattern - do not revert.
+Never edit snac_profiles.js directly - use snac_profile_enricher.js for patches.
+Always read actual profile field shapes before writing SpeciesScreen display logic.
+
+Current SDK: 54. Working package.json is in the handoff document.
+
+Read the handoff document fully before writing any code. All architecture decisions,
+known issues, and roadmap are documented there.
+
+Current priorities are listed in the "Next Session Priority Queue" section.
+---
+
+---
 End of Master Handoff Document V6
 Phase 3 complete. Phase 4 architecture locked. Vision layer ready to build when machine available.
