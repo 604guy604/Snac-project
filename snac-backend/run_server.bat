@@ -1,5 +1,5 @@
 @echo off
-echo Starting SNAC Backend - Layer 4 Vision API...
+echo Starting SNAC Backend - Layer 4 Vision API with YOLO...
 echo.
 echo Make sure Python 3.11+ is installed and in PATH
 echo.
@@ -11,7 +11,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 echo.
-echo Installing dependencies...
+echo Installing dependencies (including PyTorch and ultralytics for YOLO)...
 pip install -r requirements.txt
 if %errorlevel% neq 0 (
     echo ERROR: Failed to install dependencies
@@ -19,6 +19,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 echo.
+echo Loading YOLO model from HuggingFace (this may take a moment)...
 echo Starting FastAPI server on http://localhost:8000
 echo Press Ctrl+C to stop
 echo.
