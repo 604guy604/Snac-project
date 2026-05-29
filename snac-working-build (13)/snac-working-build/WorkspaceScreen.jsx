@@ -3,6 +3,7 @@ import {
   View, Text, TouchableOpacity, StyleSheet,
   Platform, ActivityIndicator, ScrollView, Alert
 } from 'react-native';
+import * as Location from 'expo-location';
 import { useSnac } from './useSnac.js';
 import ResultsScreen from './ResultsScreen.jsx';
 import HarvestScreen from './HarvestScreen.jsx';
@@ -20,25 +21,63 @@ export default function WorkspaceScreen() {
     sessionMemory,
     sessionSummaryLine,
     inputState,
+    setInputState,
     confidenceLayers,
     decision,
     summary,
     clearSession,
   } = useSnac();
 
+  const captureGps = useCallback(async () => {
+    try {
+      const perm = await Location.requestForegroundPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert(
+          'GPS Permission Required',
+          'Allow location access to capture harvest coordinates for weather, habitat, and scent analysis.'
+        );
+        return null;
+      }
+
+      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      return {
+        latitude: loc.coords.latitude,
+        longitude: loc.coords.longitude,
+      };
+    } catch (err) {
+      Alert.alert('GPS Error', err?.message ?? 'Unable to get location');
+      return null;
+    }
+  }, []);
+
   const handleAnalyse = useCallback(async () => {
+    let harvestGps = inputState?.harvestGps ?? null;
+
+    if (!harvestGps) {
+      harvestGps = await captureGps();
+      if (!harvestGps) return;
+      setInputState({
+        ...(inputState ?? {}),
+        harvestGps,
+        harvestTimestamp: new Date().toISOString(),
+      });
+    }
+
     const result = await run({
       currentScreenState: {
         ...(inputState ?? {}),
         localHour: new Date().getHours(),
+        harvestGps,
       },
       huntingPressure: inputState?.huntingPressure ?? 'none',
-      gpsCoords: inputState?.harvestGps
-        ? { lat: inputState.harvestGps.latitude, lon: inputState.harvestGps.longitude }
-        : null,
+      gpsCoords: {
+        lat: harvestGps.latitude,
+        lon: harvestGps.longitude,
+      },
     });
+
     if (result) setView('results');
-  }, [run, inputState]);
+  }, [run, inputState, setInputState, captureGps]);
 
   const handleDifferentAnimal = useCallback(() => {
     Alert.alert(
