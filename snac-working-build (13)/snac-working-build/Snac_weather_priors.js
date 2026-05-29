@@ -1,7 +1,7 @@
 import { SOURCE, CONFIDENCE } from './snac_input_schema.js';
 
 // =============================================================================
-// SNAC Field Intelligence - Phase 3.4
+// SNAC Field Intelligence - Phase 4.0
 // snac_weather_priors.js
 // Weather behavioral priors - movement likelihood from current conditions
 // =============================================================================
@@ -17,7 +17,8 @@ import { SOURCE, CONFIDENCE } from './snac_input_schema.js';
 //   Optimal ungulate movement: 30.00-30.40 inHg stable
 //   Pressure dropping fast = movement spike before front
 //   Post-rain clearance = peak movement window
-// - Wind species-specific
+// - Wind speed + direction (Phase 4)
+//   Direction now tracked and returned as cardinal (N/NE/E/SE/S/SW/W/NW)
 //   Deer: high sensitivity (wind masks hunter scent - cuts movement)
 //   Bears: ignore wind almost entirely
 //   Canids: use wind actively, movement increases
@@ -36,18 +37,21 @@ import { SOURCE, CONFIDENCE } from './snac_input_schema.js';
 //   Animals that sheltered start moving hard
 //
 // OUTPUT:
-//   movement_likelihood  0.0-1.0
-//   movement_label       'peak' | 'good' | 'moderate' | 'slow' | 'poor'
-//   pressure_trend_label 'rising fast' | 'rising' | 'steady' | 'dropping' | 'dropping fast'
-//   follow_boost         -0.3 to +0.3 adjustment for follow priority
-//   notes[]              human readable field observations
+//   movement_likelihood    0.0-1.0
+//   movement_label         'peak' | 'good' | 'moderate' | 'slow' | 'poor'
+//   pressure_trend_label   'rising fast' | 'rising' | 'steady' | 'dropping' | 'dropping fast'
+//   wind_direction_deg     0-360 degrees from Open-Meteo
+//   wind_direction_cardinal 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW' | null
+//   follow_boost           -0.3 to +0.3 adjustment for follow priority
+//   notes[]                human readable field observations
 //
 // =============================================================================
 
 // Open-Meteo API - free, no key, returns hourly weather
+// Phase 4: winddirection_10m added
 const OPEN_METEO_URL =
   'https://api.open-meteo.com/v1/forecast?' +
-  'hourly=pressure_msl,windspeed_10m,precipitation,weathercode,temperature_2m' +
+  'hourly=pressure_msl,windspeed_10m,winddirection_10m,precipitation,weathercode,temperature_2m' +
   '&current_weather=true' +
   '&forecast_days=1' +
   '&timezone=auto';
@@ -64,6 +68,14 @@ function pressureTrendLabel(trend) {
   if (trend < -2.0) return 'dropping fast';
   if (trend < -0.5) return 'dropping';
   return 'steady';
+}
+
+// Wind direction degrees to cardinal
+// Returns N, NE, E, SE, S, SW, W, NW or null if no data
+function degreesToCardinal(deg) {
+  if (deg === null || deg === undefined) return null;
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  return dirs[Math.round(deg / 45) % 8];
 }
 
 // Moon phase 0.0-1.0 from date
@@ -179,6 +191,7 @@ function parseWeatherData(data) {
   const hourly      = data.hourly ?? {};
   const pressures   = hourly.pressure_msl ?? [];
   const winds       = hourly.windspeed_10m ?? [];
+  const winddirs    = hourly.winddirection_10m ?? [];
   const precip      = hourly.precipitation ?? [];
   const codes       = hourly.weathercode ?? [];
   const temps       = hourly.temperature_2m ?? [];
@@ -203,15 +216,16 @@ function parseWeatherData(data) {
   const isClearing  = recentPrecip > 0.2 && currentCode <= 3;
 
   return {
-    pressure_hpa:      pressureNow,
-    pressure_inhg:     pressureNow ? hpaToInHg(pressureNow) : null,
-    pressure_trend_hpa: pressureTrendHpa,
-    windspeed_kmh:     winds[hour] ?? current.windspeed ?? null,
-    temperature_c:     temps[hour] ?? current.temperature ?? null,
-    weather_code:      currentCode,
-    recent_precip_mm:  recentPrecip,
-    is_post_rain:      isClearing,
-    raw_current:       current,
+    pressure_hpa:        pressureNow,
+    pressure_inhg:       pressureNow ? hpaToInHg(pressureNow) : null,
+    pressure_trend_hpa:  pressureTrendHpa,
+    windspeed_kmh:       winds[hour] ?? current.windspeed ?? null,
+    winddirection_deg:   winddirs[hour] ?? null,
+    temperature_c:       temps[hour] ?? current.temperature ?? null,
+    weather_code:        currentCode,
+    recent_precip_mm:    recentPrecip,
+    is_post_rain:        isClearing,
+    raw_current:         current,
   };
 }
 
@@ -231,32 +245,26 @@ function scorePressure(pressureInHg, trendHpa, notes) {
     score += 0.15;
     notes.push('Barometric pressure in optimal movement range');
   } else if (pressureInHg > 30.40) {
-    // High and stable - still good but past peak
     score += 0.08;
   } else if (pressureInHg < 29.50) {
-    // Low pressure - storm conditions, movement suppressed
     score -= 0.15;
     notes.push('Low pressure system - movement generally suppressed');
   }
 
   // Trend adjustments
   if (trendLabel === 'dropping fast') {
-    // Pressure dropping fast = movement spike before front
-    // Animals feed hard before weather closes in
     score += 0.20;
     notes.push('Pressure dropping fast - animals feeding hard before incoming front');
   } else if (trendLabel === 'dropping') {
     score += 0.10;
     notes.push('Pressure dropping - pre-front movement increase likely');
   } else if (trendLabel === 'rising fast') {
-    // Post-storm clearing - also good
     score += 0.12;
     notes.push('Pressure rising fast - post-storm movement increasing');
   } else if (trendLabel === 'rising') {
     score += 0.06;
     notes.push('Pressure rising - conditions improving');
   } else {
-    // Steady - good for prediction
     score += 0.05;
     notes.push('Pressure steady - movement patterns predictable');
   }
@@ -269,11 +277,6 @@ function scoreWind(windKmh, speciesGroup, notes) {
 
   const sensitivity = WIND_SENSITIVITY[speciesGroup] ?? WIND_SENSITIVITY.default;
 
-  // Wind thresholds
-  // < 8 kmh  = calm, no effect
-  // 8-20     = light, slight suppression for sensitive species
-  // 20-35    = moderate, significant suppression for ungulates
-  // > 35     = strong, major suppression for all prey, canids less affected
   let windPenalty = 0;
   if (windKmh > 35) {
     windPenalty = 0.25 * sensitivity;
@@ -287,7 +290,7 @@ function scoreWind(windKmh, speciesGroup, notes) {
 
   // Canids get a bonus in moderate wind - they use it to hunt
   if ((speciesGroup === 'canid') && windKmh > 8 && windKmh < 35) {
-    return -windPenalty + 0.08; // net positive
+    return -windPenalty + 0.08;
   }
 
   return -windPenalty;
@@ -297,8 +300,6 @@ function scoreMoon(phase, localHour, notes) {
   const label = moonLabel(phase);
   let score   = 0;
 
-  // Full moon effect: animals already moved at night
-  // Dawn peak is muted - they fed at night, now bedded
   if (label === 'full') {
     if (localHour >= 5 && localHour <= 8) {
       score -= 0.12;
@@ -312,7 +313,6 @@ function scoreMoon(phase, localHour, notes) {
     }
   }
 
-  // New moon: sharpens dawn and dusk peaks - animals move in darkness, concentrate at edges
   if (label === 'new') {
     if ((localHour >= 5 && localHour <= 9) || (localHour >= 17 && localHour <= 20)) {
       score += 0.10;
@@ -330,14 +330,12 @@ function scoreTemperature(tempC, month, speciesGroup, notes) {
 
   const isRutSeason = month >= 10 && month <= 12;
 
-  // Extreme cold suppresses most species
   if (tempC < -15) {
     score -= 0.15;
     notes.push('Extreme cold - movement suppressed, animals conserving energy');
     return score;
   }
 
-  // Cold snap in fall triggers movement for ungulates
   if (isRutSeason && speciesGroup === 'ungulate') {
     if (tempC < 5) {
       score += 0.12;
@@ -348,7 +346,6 @@ function scoreTemperature(tempC, month, speciesGroup, notes) {
     }
   }
 
-  // General temperature comfort range for most ungulates: 2-15C
   if (tempC >= 2 && tempC <= 15) {
     score += 0.05;
   } else if (tempC > 28) {
@@ -361,10 +358,8 @@ function scoreTemperature(tempC, month, speciesGroup, notes) {
 
 function scorePostRain(isPostRain, recentPrecipMm, notes) {
   if (!isPostRain) return 0;
-  // Post-rain clearance = peak movement window
-  // Animals that sheltered emerge and feed hard
-  const intensity = Math.min(recentPrecipMm / 10, 1); // normalize 0-1
-  const bonus     = 0.10 + (intensity * 0.12); // 0.10-0.22 bonus
+  const intensity = Math.min(recentPrecipMm / 10, 1);
+  const bonus     = 0.10 + (intensity * 0.12);
   notes.push('Post-rain clearance - peak movement window. Animals emerging from shelter.');
   return bonus;
 }
@@ -375,7 +370,7 @@ function scoreFog(weatherCode, speciesGroup, notes) {
 
   if (speciesGroup === 'felid' || speciesGroup === 'canid') {
     notes.push('Fog - predator advantage. Ambush predators more active.');
-    return 0.08; // predators benefit
+    return 0.08;
   }
   if (speciesGroup === 'ungulate') {
     notes.push('Fog - prey species more cautious. Cannot see threats. Movement reduced.');
@@ -395,14 +390,6 @@ function movementLabel(score) {
 // =============================================================================
 // MAIN EXPORT: scoreWeatherPriors
 // =============================================================================
-// Inputs:
-//   resolved      - output of resolveInputs() from snac_inference_engine.js
-//   gpsCoords     - { lat, lon } for Open-Meteo fetch, null if unavailable
-//   manualOverride - optional manual weather values if no GPS/network
-//
-// Output:
-//   Full weather prior object consumed by snac_hunting_pressure.js
-//   and snac_sensor_fusion.js
 
 export async function scoreWeatherPriors(resolved = {}, gpsCoords = null, manualOverride = null) {
   const notes        = [];
@@ -419,24 +406,23 @@ export async function scoreWeatherPriors(resolved = {}, gpsCoords = null, manual
     weather   = parseWeatherData(raw);
   }
 
-  // Manual override - user entered conditions in UI
-  // Fills gaps when network unavailable
+  // Manual override
   if (manualOverride) {
     weather = {
-      pressure_hpa:       manualOverride.pressureHpa ?? null,
-      pressure_inhg:      manualOverride.pressureHpa ? hpaToInHg(manualOverride.pressureHpa) : null,
-      pressure_trend_hpa: 0,
-      windspeed_kmh:      manualOverride.windKmh ?? null,
-      temperature_c:      manualOverride.tempC ?? null,
-      weather_code:       manualOverride.weatherCode ?? 0,
-      recent_precip_mm:   0,
-      is_post_rain:       manualOverride.postRain ?? false,
-      raw_current:        null,
+      pressure_hpa:        manualOverride.pressureHpa ?? null,
+      pressure_inhg:       manualOverride.pressureHpa ? hpaToInHg(manualOverride.pressureHpa) : null,
+      pressure_trend_hpa:  0,
+      windspeed_kmh:       manualOverride.windKmh ?? null,
+      winddirection_deg:   manualOverride.windDirectionDeg ?? null,
+      temperature_c:       manualOverride.tempC ?? null,
+      weather_code:        manualOverride.weatherCode ?? 0,
+      recent_precip_mm:    0,
+      is_post_rain:        manualOverride.postRain ?? false,
+      raw_current:         null,
     };
   }
 
-  // Also check the resolved input schema for manually entered weather code
-  // This comes from the UI weather pill selection
+  // UI weather pill fallback
   const uiWeatherCode = resolved.weather?.value ?? null;
   const uiWeatherCodeMap = {
     'clear':       0,
@@ -445,22 +431,22 @@ export async function scoreWeatherPriors(resolved = {}, gpsCoords = null, manual
     'heavy_rain':  65,
     'snow':        73,
     'fog':         45,
-    'windy':       null, // not a WMO code - handled as wind modifier
+    'windy':       null,
   };
 
-  // If no GPS and no override but UI weather pill set, use that
   if (!weather && uiWeatherCode) {
     const mappedCode = uiWeatherCodeMap[uiWeatherCode] ?? 0;
     weather = {
-      pressure_hpa:       null,
-      pressure_inhg:      null,
-      pressure_trend_hpa: 0,
-      windspeed_kmh:      uiWeatherCode === 'windy' ? 30 : null,
-      temperature_c:      resolved.temperature?.value ?? null,
-      weather_code:       mappedCode,
-      recent_precip_mm:   0,
-      is_post_rain:       false,
-      raw_current:        null,
+      pressure_hpa:        null,
+      pressure_inhg:       null,
+      pressure_trend_hpa:  0,
+      windspeed_kmh:       uiWeatherCode === 'windy' ? 30 : null,
+      winddirection_deg:   null,
+      temperature_c:       resolved.temperature?.value ?? null,
+      weather_code:        mappedCode,
+      recent_precip_mm:    0,
+      is_post_rain:        false,
+      raw_current:         null,
     };
     notes.push('Weather from UI selection - no GPS data available');
   }
@@ -468,34 +454,36 @@ export async function scoreWeatherPriors(resolved = {}, gpsCoords = null, manual
   // Fallback - no data at all
   if (!weather) {
     return {
-      movement_likelihood:  0.50,
-      movement_label:       'moderate',
-      pressure_trend_label: 'steady',
-      pressure_inhg:        null,
-      wind_kmh:             null,
-      temperature_c:        null,
-      moon_label:           moonLabel(moonPhase(now)),
-      moon_phase:           Math.round(moonPhase(now) * 100),
-      weather_code:         null,
-      condition:            'unknown',
-      is_post_rain:         false,
-      follow_boost:         0,
-      notes:                ['No weather data available - movement likelihood set to neutral'],
-      source:               SOURCE.DEFAULT,
-      confidence:           CONFIDENCE.NONE,
-      species_group:        speciesGroup,
+      movement_likelihood:    0.50,
+      movement_label:         'moderate',
+      pressure_trend_label:   'steady',
+      pressure_inhg:          null,
+      wind_kmh:               null,
+      wind_direction_deg:     null,
+      wind_direction_cardinal: null,
+      temperature_c:          null,
+      moon_label:             moonLabel(moonPhase(now)),
+      moon_phase:             Math.round(moonPhase(now) * 100),
+      weather_code:           null,
+      condition:              'unknown',
+      is_post_rain:           false,
+      follow_boost:           0,
+      notes:                  ['No weather data available - movement likelihood set to neutral'],
+      source:                 SOURCE.DEFAULT,
+      confidence:             CONFIDENCE.NONE,
+      species_group:          speciesGroup,
     };
   }
 
   // Score each component
-  let totalScore = 0.50; // neutral base
+  let totalScore = 0.50;
 
   const { score: pressureScore, trendLabel } = scorePressure(
     weather.pressure_inhg,
     weather.pressure_trend_hpa,
     notes
   );
-  totalScore += (pressureScore - 0.50); // delta from neutral
+  totalScore += (pressureScore - 0.50);
 
   const windScore = scoreWind(weather.windspeed_kmh, speciesGroup, notes);
   totalScore += windScore;
@@ -513,38 +501,37 @@ export async function scoreWeatherPriors(resolved = {}, gpsCoords = null, manual
   const fogScore = scoreFog(weather.weather_code, speciesGroup, notes);
   totalScore += fogScore;
 
-  // Weather code base modifier
   const codeEntry = WEATHER_CODE_MAP[weather.weather_code];
   if (codeEntry) totalScore += codeEntry.moveMod;
 
-  // Clamp 0.0-1.0
   const finalScore = Math.max(0, Math.min(1, totalScore));
   const label      = movementLabel(finalScore);
   const condition  = codeEntry?.condition ?? 'unknown';
-
-  // Follow boost - passed to hunting pressure and fusion
-  // Score above 0.60 = positive boost, below 0.40 = negative
   const followBoost = Number(((finalScore - 0.50) * 0.6).toFixed(3));
 
+  // Wind direction cardinal conversion
+  const windDirectionCardinal = degreesToCardinal(weather.winddirection_deg);
+
   return {
-    movement_likelihood:  Number(finalScore.toFixed(3)),
-    movement_label:       label,
-    pressure_trend_label: trendLabel,
-    pressure_inhg:        weather.pressure_inhg ? Number(weather.pressure_inhg.toFixed(2)) : null,
-    wind_kmh:             weather.windspeed_kmh,
-    temperature_c:        weather.temperature_c,
-    moon_label:           mLabel,
-    moon_phase:           mPhase,
-    weather_code:         weather.weather_code,
+    movement_likelihood:     Number(finalScore.toFixed(3)),
+    movement_label:          label,
+    pressure_trend_label:    trendLabel,
+    pressure_inhg:           weather.pressure_inhg ? Number(weather.pressure_inhg.toFixed(2)) : null,
+    wind_kmh:                weather.windspeed_kmh,
+    wind_direction_deg:      weather.winddirection_deg ?? null,
+    wind_direction_cardinal: windDirectionCardinal,
+    temperature_c:           weather.temperature_c,
+    moon_label:              mLabel,
+    moon_phase:              mPhase,
+    weather_code:            weather.weather_code,
     condition,
-    is_post_rain:         weather.is_post_rain,
-    follow_boost:         followBoost,
+    is_post_rain:            weather.is_post_rain,
+    follow_boost:            followBoost,
     notes,
-    source:               gpsCoords ? SOURCE.MEASURED : (manualOverride ? SOURCE.USER : SOURCE.INFERRED),
-    confidence:           gpsCoords ? CONFIDENCE.HIGH : (uiWeatherCode ? CONFIDENCE.MEDIUM : CONFIDENCE.LOW),
-    species_group:        speciesGroup,
+    source:                  gpsCoords ? SOURCE.MEASURED : (manualOverride ? SOURCE.USER : SOURCE.INFERRED),
+    confidence:              gpsCoords ? CONFIDENCE.HIGH : (uiWeatherCode ? CONFIDENCE.MEDIUM : CONFIDENCE.LOW),
+    species_group:           speciesGroup,
   };
 }
 
-export { SPECIES_GROUP, WIND_SENSITIVITY, WEATHER_CODE_MAP, moonPhase, moonLabel };
-
+export { SPECIES_GROUP, WIND_SENSITIVITY, WEATHER_CODE_MAP, moonPhase, moonLabel, degreesToCardinal };

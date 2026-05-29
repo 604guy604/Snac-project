@@ -11,6 +11,10 @@
  *
  * Phase 3.9: analyzeSession() runs after every addTrack() and inside run().
  * follow_modifier from session memory is applied to final tracking_confidence.
+ *
+ * Phase 4.0: weatherResult from the most recent track is now captured,
+ * stored, and exposed so the UI can surface movement likelihood, pressure
+ * trend, moon phase, wind speed + direction, and condition.
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -46,6 +50,7 @@ const _store = {
   rawResult:      null,
   confidenceLayers: null,
   probabilityList:  [],
+  weatherResult:  null,   // Phase 4.0 - most recent track weather priors
   sessionTracks:  [],
   sessionMemory:  null,   // Phase 3.9 - output of analyzeSession()
   inputState:     {},
@@ -240,6 +245,7 @@ async function runWithPhase3({ currentScreenState, sessionTracks, huntingPressur
     decision:          patchedDecision,
     confidenceLayers,
     probabilityList:   confidenceLayers.summary?.species_probability_list ?? [],
+    weatherResult:     last.weatherResult,   // Phase 4.0 - surface to UI
     sessionTrackCount: allStates.length,
     sessionMemory:     sessionMem,
     raw:               fullResult,
@@ -268,6 +274,7 @@ function _clearSession() {
     rawResult:        null,
     confidenceLayers: null,
     probabilityList:  [],
+    weatherResult:    null,
     error:            null,
   });
 }
@@ -290,6 +297,7 @@ async function _run({ currentScreenState = {}, huntingPressure = 'none', gpsCoor
       decision:         result.decision,
       confidenceLayers: result.confidenceLayers,
       probabilityList:  result.probabilityList ?? [],
+      weatherResult:    result.weatherResult ?? null,
       sessionMemory:    result.sessionMemory,
       loading:          false,
     });
@@ -380,6 +388,7 @@ export function useSnac() {
       rawResult:        null,
       confidenceLayers: null,
       probabilityList:  [],
+      weatherResult:    null,
       error:            null,
     });
   }, []);
@@ -400,6 +409,7 @@ export function useSnac() {
     rawResult:        state.rawResult,
     confidenceLayers: state.confidenceLayers,
     probabilityList:  state.probabilityList,
+    weatherResult:    state.weatherResult,
     // Session
     sessionTracks:    state.sessionTracks,
     sessionTrackCount: state.sessionTracks.length,
