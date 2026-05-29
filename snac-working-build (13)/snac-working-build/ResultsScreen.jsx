@@ -3,7 +3,7 @@ import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet, Platform
 } from 'react-native';
 import { useSnac } from './useSnac.js';
-import { useUnits, formatDistance, convertHomeRange } from './snac_units.js';
+import { useUnits, formatDistance } from './snac_units.js';
 
 const MONO = Platform.OS === 'ios' ? 'Courier New' : 'monospace';
 
@@ -20,10 +20,8 @@ function BarRow({ label, value, color }) {
   );
 }
 
-// onBack  -> WorkspaceScreen sets view back to 'workspace'
-// onHarvest -> WorkspaceScreen sets view to 'harvest'
 export default function ResultsScreen({ onBack, onHarvest }) {
-  const { summary, decision, rawResult, confidenceLayers, probabilityList, clearSession } = useSnac();
+  const { summary, decision, rawResult, confidenceLayers, probabilityList, weatherResult, terrainAnchor, clearSession } = useSnac();
   const { system: units } = useUnits();
 
   if (!decision || !summary) {
@@ -51,6 +49,36 @@ export default function ResultsScreen({ onBack, onHarvest }) {
     insufficient_data:           { t: 'INSUFFICIENT DATA', c: '#3A4A3C' },
   };
   const { t: recTxt, c: recColor } = recMap[rec] ?? recMap.insufficient_data;
+
+  // ---- weather helpers ----
+  const moveColor = lbl => ({
+    peak: '#4EFF6E', good: '#4EFF6E', moderate: '#FFB84E', slow: '#FF8A4E', poor: '#FF4E4E',
+  }[lbl] ?? '#7A917C');
+
+  const windArrow = card => ({
+    N: '\u2193', NE: '\u2199', E: '\u2190', SE: '\u2196',
+    S: '\u2191', SW: '\u2197', W: '\u2192', NW: '\u2198',
+  }[card] ?? '');
+
+  const fmtTemp = c => c == null ? '-' : `${Math.round(c)}\u00B0C`;
+  const fmtWind = k => k == null ? '-' : `${Math.round(k)} km/h`;
+
+  const scent = weatherResult?.scent_approach ?? null;
+
+  // ---- terrain anchor helpers ----
+  const ta = (terrainAnchor && terrainAnchor.has_terrain_data) ? terrainAnchor : null;
+  const waterWindowColor = w => ({
+    open:    '#4EFF6E',
+    closing: '#FFB84E',
+    closed:  '#FF8A4E',
+    none:    '#7A917C',
+  }[w] ?? '#7A917C');
+  const waterWindowLabel = w => ({
+    open:    'WINDOW OPEN',
+    closing: 'WINDOW CLOSING',
+    closed:  'WINDOW CLOSED',
+    none:    'NO WATER',
+  }[w] ?? '-');
 
   return (
     <View style={st.root}>
@@ -88,7 +116,6 @@ export default function ResultsScreen({ onBack, onHarvest }) {
               <Text style={st.confBlockPct}>%</Text>
             </Text>
           </View>
-          {/* Session memory modifier note */}
           {decision.session_follow_mod && decision.session_follow_mod !== 1.0 && (
             <Text style={st.sessionModNote}>
               Session pattern applied: {decision.session_follow_mod > 1 ? '+' : ''}
@@ -96,6 +123,175 @@ export default function ResultsScreen({ onBack, onHarvest }) {
             </Text>
           )}
         </View>
+
+        {/* ---- Phase 4.1: SCENT & APPROACH ---- */}
+        {scent && (
+          <View style={[st.scentCard, { borderColor: scent.hot ? '#FF6B35' : '#C8A84B' }]}>
+            <View style={st.scentHeaderRow}>
+              <Text style={[st.sectionTitle, { marginBottom: 0 }]}>SCENT & APPROACH</Text>
+              {scent.hot && (
+                <View style={st.hotBadge}>
+                  <Text style={st.hotBadgeTxt}>HOT TRACK</Text>
+                </View>
+              )}
+            </View>
+
+            <View style={st.scentVectorRow}>
+              <Text style={[st.scentArrow, { color: scent.hot ? '#FF6B35' : '#C8A84B' }]}>
+                {windArrow(weatherResult.wind_direction_cardinal)}
+              </Text>
+              <View style={{ flex: 1 }}>
+                <Text style={st.scentApproachLabel}>APPROACH FROM</Text>
+                <Text style={[st.scentApproachVal, { color: scent.hot ? '#FF6B35' : '#C8A84B' }]}>
+                  {scent.approach_cardinal ?? '-'}
+                </Text>
+              </View>
+              <View style={{ alignItems: 'flex-end' }}>
+                <Text style={st.scentApproachLabel}>SCENT CARRIES</Text>
+                <Text style={st.scentToVal}>{scent.scent_to_cardinal ?? '-'}</Text>
+              </View>
+            </View>
+
+            <Text style={st.scentAdvice}>{scent.advice}</Text>
+          </View>
+        )}
+
+        {/* ---- Phase 4.2: TERRAIN ANCHORS ---- */}
+        {ta && (
+          <View style={st.card}>
+            <Text style={st.sectionTitle}>TERRAIN ANCHORS</Text>
+
+            {/* Water feature */}
+            {ta.water_type && ta.water_type !== 'none' && (
+              <View style={st.terrainBlock}>
+                <View style={st.terrainRowHeader}>
+                  <Text style={st.terrainFeatureLabel}>
+                    {ta.water_type === 'permanent' ? 'PERMANENT WATER' : 'EPHEMERAL WATER'}
+                    {ta.water_condition ? ` - ${ta.water_condition.toUpperCase()}` : ''}
+                  </Text>
+                  <Text style={[st.terrainWindowBadge, {
+                    color: waterWindowColor(ta.water_window),
+                    borderColor: waterWindowColor(ta.water_window),
+                  }]}>
+                    {waterWindowLabel(ta.water_window)}
+                  </Text>
+                </View>
+                <View style={st.terrainPullRow}>
+                  <Text style={st.terrainPullLabel}>WATER PULL</Text>
+                  <View style={st.terrainPullTrack}>
+                    <View style={[st.terrainPullFill, {
+                      width: `${Math.round((ta.water_pull ?? 0) * 100)}%`,
+                      backgroundColor: waterWindowColor(ta.water_window),
+                    }]} />
+                  </View>
+                  <Text style={[st.terrainPullPct, { color: waterWindowColor(ta.water_window) }]}>
+                    {Math.round((ta.water_pull ?? 0) * 100)}%
+                  </Text>
+                </View>
+              </View>
+            )}
+
+            {/* Channel */}
+            {ta.terrain_channel && ta.terrain_channel !== 'flat' && (
+              <View style={st.terrainBlock}>
+                <Text style={st.terrainFeatureLabel}>
+                  {ta.terrain_channel.toUpperCase()} - {(ta.channel_effect ?? '').replace(/_/g,' ').toUpperCase()}
+                </Text>
+                {ta.scent_channel_note && (
+                  <Text style={st.terrainScentNote}>{ta.scent_channel_note}</Text>
+                )}
+              </View>
+            )}
+
+            {/* Follow modifier readout */}
+            {ta.follow_modifier !== 0 && (
+              <Text style={st.terrainModNote}>
+                Terrain {ta.follow_modifier > 0 ? 'raises' : 'lowers'} follow value by {Math.abs(Math.round(ta.follow_modifier * 100))}%
+              </Text>
+            )}
+
+            {/* Anchor notes */}
+            {ta.anchor_notes?.length > 0 && (
+              <View style={st.terrainNotes}>
+                {ta.anchor_notes.map((n, i) => (
+                  <View key={i} style={st.evidenceRow}>
+                    <Text style={st.evidenceDot}>-</Text>
+                    <Text style={st.evidenceTxt}>{n}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
+        )}
+
+        {/* ---- Phase 4.0: WEATHER / CONDITIONS ---- */}
+        {weatherResult && (
+          <View style={st.card}>
+            <Text style={st.sectionTitle}>CONDITIONS</Text>
+
+            <View style={st.weatherHeadline}>
+              <View style={{ flex: 1 }}>
+                <Text style={st.weatherMoveLabel}>MOVEMENT</Text>
+                <Text style={[st.weatherMoveVal, { color: moveColor(weatherResult.movement_label) }]}>
+                  {(weatherResult.movement_label ?? 'unknown').toUpperCase()}
+                </Text>
+              </View>
+              <View style={st.weatherMoveBarWrap}>
+                <View style={st.weatherMoveBarTrack}>
+                  <View style={[st.weatherMoveBarFill, {
+                    width: `${Math.round((weatherResult.movement_likelihood ?? 0) * 100)}%`,
+                    backgroundColor: moveColor(weatherResult.movement_label),
+                  }]} />
+                </View>
+                <Text style={[st.weatherMovePct, { color: moveColor(weatherResult.movement_label) }]}>
+                  {Math.round((weatherResult.movement_likelihood ?? 0) * 100)}%
+                </Text>
+              </View>
+            </View>
+
+            <View style={st.statGrid}>
+              <View style={st.statCell}>
+                <Text style={st.statVal}>{(weatherResult.condition ?? '-').replace(/_/g,' ').toUpperCase()}</Text>
+                <Text style={st.statLabel}>CONDITION</Text>
+              </View>
+              <View style={st.statCell}>
+                <Text style={st.statVal}>{fmtTemp(weatherResult.temperature_c)}</Text>
+                <Text style={st.statLabel}>TEMP</Text>
+              </View>
+              <View style={st.statCell}>
+                <Text style={st.statVal}>{fmtWind(weatherResult.wind_kmh)}</Text>
+                <Text style={st.statLabel}>WIND SPEED</Text>
+              </View>
+              <View style={st.statCell}>
+                <Text style={st.statVal}>
+                  {weatherResult.wind_direction_cardinal
+                    ? `${windArrow(weatherResult.wind_direction_cardinal)} ${weatherResult.wind_direction_cardinal}`
+                    : '-'}
+                </Text>
+                <Text style={st.statLabel}>WIND DIR</Text>
+              </View>
+              <View style={st.statCell}>
+                <Text style={st.statVal}>{(weatherResult.pressure_trend_label ?? '-').toUpperCase()}</Text>
+                <Text style={st.statLabel}>PRESSURE</Text>
+              </View>
+              <View style={st.statCell}>
+                <Text style={st.statVal}>{(weatherResult.moon_label ?? '-').replace(/_/g,' ').toUpperCase()}</Text>
+                <Text style={st.statLabel}>MOON</Text>
+              </View>
+            </View>
+
+            {weatherResult.notes?.length > 0 && (
+              <View style={st.weatherNotes}>
+                {weatherResult.notes.slice(0, 6).map((n, i) => (
+                  <View key={i} style={st.evidenceRow}>
+                    <Text style={st.evidenceDot}>-</Text>
+                    <Text style={st.evidenceTxt}>{n}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </View>
+        )}
 
         {/* Session synthesis */}
         {decision.session_synthesis ? (
@@ -110,14 +306,12 @@ export default function ResultsScreen({ onBack, onHarvest }) {
           </View>
         ) : null}
 
-        {/* Habitat plausibility - only shown when scored (20 real species + GPS) */}
+        {/* Habitat plausibility */}
         {decision.habitat_scored && decision.habitat_plausibility != null ? (
           <View style={st.card}>
             <Text style={st.sectionTitle}>HABITAT PLAUSIBILITY</Text>
             <View style={st.habitatRow}>
-              <Text style={st.habitatScore}>
-                {Math.round(decision.habitat_plausibility * 100)}%
-              </Text>
+              <Text style={st.habitatScore}>{Math.round(decision.habitat_plausibility * 100)}%</Text>
               <View style={{ flex: 1 }}>
                 {decision.biome_inferred ? (
                   <Text style={st.habitatBiome}>{decision.biome_inferred.replace(/_/g,' ').toUpperCase()}</Text>
@@ -309,4 +503,40 @@ const st = StyleSheet.create({
   habitatScore:     { fontFamily: MONO, fontSize: 32, fontWeight: '700', color: '#4EFF6E', width: 64 },
   habitatBiome:     { fontFamily: MONO, fontSize: 10, letterSpacing: 2, color: '#E2EAE3', marginBottom: 4 },
   habitatNote:      { fontFamily: MONO, fontSize: 9, letterSpacing: 0.5, color: '#7A917C', lineHeight: 15 },
+
+  // ---- weather panel ----
+  weatherHeadline:    { flexDirection: 'row', alignItems: 'center', marginBottom: 8, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: '#1C211D' },
+  weatherMoveLabel:   { fontFamily: MONO, fontSize: 8, letterSpacing: 2, color: '#7A917C', marginBottom: 4 },
+  weatherMoveVal:     { fontFamily: MONO, fontSize: 22, fontWeight: '700', letterSpacing: 2 },
+  weatherMoveBarWrap: { flex: 1, marginLeft: 12 },
+  weatherMoveBarTrack:{ height: 4, backgroundColor: '#1C211D', borderRadius: 2, overflow: 'hidden', marginBottom: 4 },
+  weatherMoveBarFill: { height: 4, borderRadius: 2 },
+  weatherMovePct:     { fontFamily: MONO, fontSize: 11, fontWeight: '700', textAlign: 'right' },
+  weatherNotes:       { marginTop: 10, paddingTop: 10, borderTopWidth: 1, borderTopColor: '#1C211D' },
+
+  // ---- scent approach panel ----
+  scentCard:        { backgroundColor: '#0F1210', borderWidth: 1.5, borderRadius: 4, padding: 16, marginBottom: 12 },
+  scentHeaderRow:   { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  hotBadge:         { backgroundColor: '#FF6B3522', borderWidth: 1, borderColor: '#FF6B35', borderRadius: 3, paddingHorizontal: 8, paddingVertical: 3 },
+  hotBadgeTxt:      { fontFamily: MONO, fontSize: 8, letterSpacing: 2, color: '#FF6B35', fontWeight: '700' },
+  scentVectorRow:   { flexDirection: 'row', alignItems: 'center', gap: 14, marginBottom: 12, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: '#1C211D' },
+  scentArrow:       { fontFamily: MONO, fontSize: 40, fontWeight: '700', lineHeight: 44 },
+  scentApproachLabel:{ fontFamily: MONO, fontSize: 8, letterSpacing: 2, color: '#7A917C', marginBottom: 3 },
+  scentApproachVal: { fontFamily: MONO, fontSize: 24, fontWeight: '700', letterSpacing: 2 },
+  scentToVal:       { fontFamily: MONO, fontSize: 16, fontWeight: '700', color: '#7A917C', letterSpacing: 1 },
+  scentAdvice:      { fontFamily: MONO, fontSize: 11, color: '#E2EAE3', lineHeight: 18 },
+
+  // ---- terrain anchor panel ----
+  terrainBlock:        { marginBottom: 14, paddingBottom: 14, borderBottomWidth: 1, borderBottomColor: '#1C211D' },
+  terrainRowHeader:    { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
+  terrainFeatureLabel: { fontFamily: MONO, fontSize: 10, letterSpacing: 1, color: '#E2EAE3', fontWeight: '700', flex: 1 },
+  terrainWindowBadge:  { fontFamily: MONO, fontSize: 8, letterSpacing: 1, borderWidth: 1, borderRadius: 3, paddingHorizontal: 6, paddingVertical: 3 },
+  terrainPullRow:      { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  terrainPullLabel:    { fontFamily: MONO, fontSize: 8, letterSpacing: 2, color: '#7A917C', width: 70 },
+  terrainPullTrack:    { flex: 1, height: 4, backgroundColor: '#1C211D', borderRadius: 2, overflow: 'hidden' },
+  terrainPullFill:     { height: 4, borderRadius: 2 },
+  terrainPullPct:      { fontFamily: MONO, fontSize: 11, fontWeight: '700', width: 36, textAlign: 'right' },
+  terrainScentNote:    { fontFamily: MONO, fontSize: 9, letterSpacing: 0.5, color: '#FFB84E', lineHeight: 15, marginTop: 4 },
+  terrainModNote:      { fontFamily: MONO, fontSize: 9, letterSpacing: 0.5, color: '#256B35', marginBottom: 8 },
+  terrainNotes:        { marginTop: 4 },
 });
