@@ -7,16 +7,14 @@
  * ResultsScreen). React hooks create isolated state per component instance,
  * so we lift all shared state into a module-level store and use a single
  * React event emitter pattern to keep all consumers in sync.
- * No prop drilling. No Context API. No navigation library changes needed.
  *
  * Phase 3.9: analyzeSession() runs after every addTrack() and inside run().
- * follow_modifier from session memory is applied to final tracking_confidence.
- *
- * Phase 4.0: weatherResult from the most recent track is now captured,
- * stored, and exposed so the UI can surface movement likelihood, pressure
- * trend, moon phase, wind speed + direction, and condition.
+ * Phase 4.0: weatherResult captured, stored, exposed.
+ * Phase 4.1: scent approach re-patched after heading known.
+ * Phase 4.2: terrain anchors scored after weather (uses wind cardinal),
+ *            stored and exposed as terrainAnchor.
  */
-
+ 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   runSnacFullAnalysis,
@@ -32,15 +30,15 @@ import { resolveInputs } from './snac_inference_engine.js';
 import { fuseSignals, flattenForEvaluators } from './snac_sensor_fusion.js';
 import { buildConfidenceLayers, buildPrePassFlags } from './snac_confidence_layers.js';
 import { applyHuntingPressure } from './Snac_hunting_pressure.js';
-import { scoreWeatherPriors } from './Snac_weather_priors.js';
+import { scoreWeatherPriors, buildScentApproach } from './Snac_weather_priors.js';
+import { scoreTerrainAnchors } from './snac_terrain_anchors.js';
 import { analyzeSession, getSessionSummaryLine } from './snac_session_memory.js';
 import { scoreHabitatPlausibility, getBiome } from './snac_habitat_gps.js';
-
+ 
 // =============================================================================
 // MODULE-LEVEL SINGLETON STORE
-// All screens share this single source of truth.
 // =============================================================================
-
+ 
 const _store = {
   ready:          false,
   loading:        false,
@@ -50,31 +48,31 @@ const _store = {
   rawResult:      null,
   confidenceLayers: null,
   probabilityList:  [],
-  weatherResult:  null,   // Phase 4.0 - most recent track weather priors
+  weatherResult:  null,
+  terrainAnchor:  null,
   sessionTracks:  [],
-  sessionMemory:  null,   // Phase 3.9 - output of analyzeSession()
+  sessionMemory:  null,
   inputState:     {},
   photoUri:       null,
 };
-
-// Simple listener registry - components subscribe/unsubscribe on mount/unmount
+ 
 const _listeners = new Set();
-
+ 
 function _notify() {
   _listeners.forEach(fn => fn({ ..._store }));
 }
-
+ 
 function _set(patch) {
   Object.assign(_store, patch);
   _notify();
 }
-
+ 
 // =============================================================================
 // INIT
 // =============================================================================
-
+ 
 let _initPromise = null;
-
+ 
 async function _init() {
   if (_initPromise) return _initPromise;
   _initPromise = (async () => {
@@ -85,21 +83,21 @@ async function _init() {
   })();
   return _initPromise;
 }
-
+ 
 // =============================================================================
 // PHASE 3 ENGINE HELPERS
 // =============================================================================
-
+ 
 function buildDetection(fusedContext, screenState, index) {
   const speciesKey = fusedContext.species?.species ?? null;
   const probList   = fusedContext.species?.species_probability_list ?? [];
-
+ 
   const classifications = probList.length > 0
     ? probList.map(p => ({ species: p.species_key, confidence: (p.probability ?? 0) / 100 }))
     : speciesKey
       ? [{ species: speciesKey, confidence: screenState.confidence ?? 0.5 }]
       : [];
-
+ 
   return {
     id: 'track_' + (index + 1) + '_' + (screenState._timestamp ?? Date.now()),
     classifications,
@@ -123,18 +121,18 @@ function buildDetection(fusedContext, screenState, index) {
     timestamp: screenState._timestamp ?? Date.now(),
   };
 }
-
+ 
 async function enrichOne(screenState, profiles, gpsCoords, huntingPressure, sharedWeather) {
   const schemaInput = snacInputFromScreenState(screenState);
-  const resolved    = resolveInputs(schemaInput, profiles);
-
+  const resolved    = resolveInputs(schemaInput, profiles, gpsCoords);
+ 
   const weatherResult = sharedWeather
     ?? await scoreWeatherPriors(resolved, gpsCoords, null);
-
+ 
   const speciesKey = resolved.species?.value ?? null;
   const localHour  = resolved.local_hour?.value ?? new Date().getHours();
   const month      = new Date().getMonth() + 1;
-
+ 
   const pressureResult = applyHuntingPressure({
     activityPrior:      resolved.activity_prior ?? null,
     weatherPrior:       weatherResult,
@@ -145,37 +143,49 @@ async function enrichOne(screenState, profiles, gpsCoords, huntingPressure, shar
     localHour,
     month,
   });
-
+ 
+  // Phase 4.2: terrain anchors - uses wind cardinal from weather when present
+  const terrainObs = {
+    water_type:      resolved.water_type?.value      ?? null,
+    water_condition: resolved.water_condition?.value  ?? null,
+    terrain_channel: resolved.terrain_channel?.value  ?? null,
+  };
+  const terrainAnchor = scoreTerrainAnchors(
+    resolved,
+    terrainObs,
+    weatherResult?.wind_direction_cardinal ?? null
+  );
+ 
   const fusedContext = fuseSignals(resolved, weatherResult, pressureResult);
   const prePassFlags = buildPrePassFlags(fusedContext);
   const flatInputs   = flattenForEvaluators(fusedContext);
-
-  return { fusedContext, flatInputs, prePassFlags, weatherResult, pressureResult, resolved };
+ 
+  return { fusedContext, flatInputs, prePassFlags, weatherResult, pressureResult, terrainAnchor, resolved };
 }
-
+ 
 async function runWithPhase3({ currentScreenState, sessionTracks, huntingPressure, profiles, gpsCoords }) {
   const allStates = [
     ...sessionTracks,
     { ...currentScreenState, _timestamp: Date.now() },
   ];
-
+ 
   const first = await enrichOne(allStates[0], profiles, gpsCoords, huntingPressure, null);
-
+ 
   const rest = await Promise.all(
     allStates.slice(1).map(ss =>
       enrichOne(ss, profiles, null, huntingPressure, first.weatherResult)
     )
   );
-
+ 
   const allEnriched = [first, ...rest];
-
+ 
   const sensorDetections = allEnriched.map((e, i) =>
     buildDetection(e.fusedContext, allStates[i], i)
   );
-
+ 
   const last      = allEnriched[allEnriched.length - 1];
   const lastState = allStates[allStates.length - 1];
-
+ 
   const rawEnvironment = {
     near_water:   last.fusedContext.near_water  ?? lastState.nearWater  ?? false,
     on_ridge:     last.fusedContext.on_ridge    ?? lastState.onRidge    ?? false,
@@ -186,38 +196,44 @@ async function runWithPhase3({ currentScreenState, sessionTracks, huntingPressur
     light_phase:  last.fusedContext.light_phase ?? lastState.lightPhase  ?? null,
     weather_code: lastState.weatherCode ?? null,
   };
-
+ 
   const rawTimeContext = {
     local_hour:  last.fusedContext.local_hour ?? new Date().getHours(),
     light_phase: last.fusedContext.light_phase ?? lastState.lightPhase ?? null,
     timestamp:   lastState._timestamp ?? Date.now(),
   };
-
+ 
   const fullResult   = runSnacFullAnalysis({ sensorDetections, rawEnvironment, rawTimeContext, speciesProfiles: profiles });
   const fieldSummary = buildSnacFieldSummary(fullResult);
   const decisionOut  = buildSnacDecisionOutput(fullResult);
-
+ 
   const confidenceLayers = buildConfidenceLayers(last.fusedContext, decisionOut, profiles);
-
-  // --- Phase 3.9: Apply session memory follow_modifier to tracking_confidence ---
+ 
+  // --- Phase 3.9: session memory follow_modifier ---
   const sessionMem = analyzeSession(sessionTracks, currentScreenState);
   const rawConf    = decisionOut?.tracking_confidence ?? 0;
   const modifier   = sessionMem?.follow_modifier ?? 1.0;
   const boostedConf = Math.min(1.0, Math.max(0, rawConf * modifier));
-
-  // --- Phase 3.10: Habitat GPS plausibility ---
+ 
+  // --- Phase 3.10: habitat GPS plausibility ---
   const speciesKey_    = currentScreenState.speciesOverride ?? null;
   const habitatResult  = scoreHabitatPlausibility(speciesKey_, gpsCoords);
   const biomeInferred  = habitatResult.biome_inferred ?? getBiome(gpsCoords);
-  // Only apply if scored===true (20 real species). Stubs: scored===false, neutral 1.0
   const habitatMod     = (habitatResult.scored && habitatResult.plausibility != null)
     ? (0.4 + habitatResult.plausibility * 0.6)
     : 1.0;
+ 
+  // --- Phase 4.2: terrain anchor follow modifier applied to confidence ---
+  // Terrain concentrates where the animal is - open water window and channeling
+  // raise follow value, closed water window lowers it. Applied as a bounded
+  // multiplier so it nudges rather than dominates.
+  const terrainFollowMod = last.terrainAnchor?.follow_modifier ?? 0;
+  const terrainMult      = 1 + terrainFollowMod; // follow_modifier is -0.15..+0.20
+ 
   const finalConf = parseFloat(
-    Math.min(1.0, Math.max(0, boostedConf * habitatMod)).toFixed(4)
+    Math.min(1.0, Math.max(0, boostedConf * habitatMod * terrainMult)).toFixed(4)
   );
-
-  // Patch decision output with boosted confidence and session synthesis
+ 
   const patchedDecision = {
     ...decisionOut,
     tracking_confidence:  finalConf,
@@ -232,39 +248,57 @@ async function runWithPhase3({ currentScreenState, sessionTracks, huntingPressur
     habitat_scored:       habitatResult.scored,
     habitat_range_note:   habitatResult.range_note,
     biome_inferred:       biomeInferred,
-    // Re-derive recommendation from final confidence
+    terrain_follow_mod:   terrainFollowMod,
     recommendation: finalConf >= 0.75 ? 'high_probability_follow'
                   : finalConf >= 0.50 ? 'moderate_probability_follow'
                   : finalConf >= 0.30 ? 'low_probability_follow'
                   : 'do_not_follow',
   };
-
+ 
+  // --- Phase 4.1: re-patch scent approach now that heading is known ---
+  let weatherOut = last.weatherResult;
+  if (weatherOut && weatherOut.wind_direction_deg != null) {
+    const headingDeg = patchedDecision.predicted_heading_deg ?? decisionOut.predicted_heading_deg ?? null;
+    const freshness  = last.resolved?.decay_correction?.corrected_freshness
+      ?? last.resolved?.freshness?.value
+      ?? null;
+    const refinedApproach = buildScentApproach(weatherOut.wind_direction_deg, headingDeg, freshness);
+    if (refinedApproach) {
+      const notes = Array.isArray(weatherOut.notes) ? [...weatherOut.notes] : [];
+      const oldAdvice = weatherOut.scent_approach?.advice ?? null;
+      const idx = oldAdvice ? notes.lastIndexOf(oldAdvice) : -1;
+      if (idx !== -1) notes.splice(idx, 1);
+      notes.push(refinedApproach.advice);
+      weatherOut = { ...weatherOut, scent_approach: refinedApproach, notes };
+    }
+  }
+ 
   return {
     valid:             true,
     summary:           fieldSummary,
     decision:          patchedDecision,
     confidenceLayers,
     probabilityList:   confidenceLayers.summary?.species_probability_list ?? [],
-    weatherResult:     last.weatherResult,   // Phase 4.0 - surface to UI
+    weatherResult:     weatherOut,
+    terrainAnchor:     last.terrainAnchor,
     sessionTrackCount: allStates.length,
     sessionMemory:     sessionMem,
     raw:               fullResult,
   };
 }
-
+ 
 // =============================================================================
-// PUBLIC ACTIONS (called by hook methods, operate on _store directly)
+// PUBLIC ACTIONS
 // =============================================================================
-
+ 
 function _addTrack(screenState) {
   const snapshot = { ...screenState, _timestamp: Date.now() };
   const nextTracks = [..._store.sessionTracks, snapshot];
-  // Run session memory immediately after adding so WorkspaceScreen status is live
   const mem = analyzeSession(nextTracks, null);
   _set({ sessionTracks: nextTracks, sessionMemory: mem });
   return { snapshot, sessionMemory: mem };
 }
-
+ 
 function _clearSession() {
   _set({
     sessionTracks:    [],
@@ -275,10 +309,11 @@ function _clearSession() {
     confidenceLayers: null,
     probabilityList:  [],
     weatherResult:    null,
+    terrainAnchor:    null,
     error:            null,
   });
 }
-
+ 
 async function _run({ currentScreenState = {}, huntingPressure = 'none', gpsCoords = null } = {}) {
   _set({ loading: true, error: null });
   try {
@@ -290,7 +325,7 @@ async function _run({ currentScreenState = {}, huntingPressure = 'none', gpsCoor
       profiles,
       gpsCoords,
     });
-
+ 
     _set({
       rawResult:        result.raw,
       summary:          result.summary,
@@ -298,10 +333,11 @@ async function _run({ currentScreenState = {}, huntingPressure = 'none', gpsCoor
       confidenceLayers: result.confidenceLayers,
       probabilityList:  result.probabilityList ?? [],
       weatherResult:    result.weatherResult ?? null,
+      terrainAnchor:    result.terrainAnchor ?? null,
       sessionMemory:    result.sessionMemory,
       loading:          false,
     });
-
+ 
     logRun({
       species_detected:    result.summary?.species_detected  || [],
       primary_behavior:    result.summary?.primary_behavior  || null,
@@ -317,40 +353,36 @@ async function _run({ currentScreenState = {}, huntingPressure = 'none', gpsCoor
       hunting_pressure:    huntingPressure,
       raw_result:          JSON.stringify(result.raw),
     }).catch(() => {});
-
+ 
     return result;
   } catch (err) {
     _set({ loading: false, error: err?.message ?? 'Unknown engine error' });
     return null;
   }
 }
-
+ 
 // =============================================================================
 // HOOK
 // =============================================================================
-
+ 
 export function useSnac() {
-  // Local state mirrors the singleton - updated via listener
   const [state, setState] = useState({ ..._store });
   const mountedRef = useRef(true);
-
+ 
   useEffect(() => {
     mountedRef.current = true;
-    // Subscribe to store updates
     const listener = (snapshot) => {
       if (mountedRef.current) setState(snapshot);
     };
     _listeners.add(listener);
-    // Sync current store immediately in case it changed before mount
     setState({ ..._store });
-
+ 
     return () => {
       mountedRef.current = false;
       _listeners.delete(listener);
     };
   }, []);
-
-  // Trigger init on first consumer mount
+ 
   useEffect(() => {
     _init()
       .then(() => {
@@ -360,27 +392,27 @@ export function useSnac() {
         _set({ error: 'Init failed: ' + (err?.message ?? 'unknown') });
       });
   }, []);
-
+ 
   const run = useCallback(async (opts) => {
     return _run(opts);
   }, []);
-
+ 
   const addTrack = useCallback((screenState) => {
     return _addTrack(screenState);
   }, []);
-
+ 
   const clearSession = useCallback(() => {
     _clearSession();
   }, []);
-
+ 
   const setInputState = useCallback((s) => {
     _set({ inputState: s });
   }, []);
-
+ 
   const setPhotoUri = useCallback((uri) => {
     _set({ photoUri: uri });
   }, []);
-
+ 
   const reset = useCallback(() => {
     _set({
       summary:          null,
@@ -389,52 +421,48 @@ export function useSnac() {
       confidenceLayers: null,
       probabilityList:  [],
       weatherResult:    null,
+      terrainAnchor:    null,
       error:            null,
     });
   }, []);
-
-  // Derived display helper
+ 
   const sessionSummaryLine = getSessionSummaryLine(state.sessionMemory);
-
+ 
   return {
-    // Engine
     run,
     loading:          state.loading,
     ready:            state.ready,
     error:            state.error,
     reset,
-    // Results
     summary:          state.summary,
     decision:         state.decision,
     rawResult:        state.rawResult,
     confidenceLayers: state.confidenceLayers,
     probabilityList:  state.probabilityList,
     weatherResult:    state.weatherResult,
-    // Session
+    terrainAnchor:    state.terrainAnchor,
     sessionTracks:    state.sessionTracks,
     sessionTrackCount: state.sessionTracks.length,
     sessionMemory:    state.sessionMemory,
     sessionSummaryLine,
     addTrack,
     clearSession,
-    // Shared input state (synced from InputsScreen)
     inputState:       state.inputState,
     setInputState,
-    // Shared photo (synced from CameraScreen)
     photoUri:         state.photoUri,
     setPhotoUri,
   };
 }
-
+ 
 // =============================================================================
-// HARVEST HOOK (standalone - harvest state is local, not shared)
+// HARVEST HOOK
 // =============================================================================
-
+ 
 export function useSnacHarvest() {
   const [submitting, setSubmitting] = useState(false);
   const [submitted,  setSubmitted]  = useState(false);
   const [error,      setError]      = useState(null);
-
+ 
   const submit = useCallback(async function({
     species         = null,
     shotDistanceYds = null,
@@ -462,11 +490,11 @@ export function useSnacHarvest() {
       setSubmitting(false);
     }
   }, []);
-
+ 
   const resetHarvest = useCallback(() => {
     setSubmitted(false);
     setError(null);
   }, []);
-
+ 
   return { submit, submitting, submitted, error, resetHarvest };
 }

@@ -1,0 +1,121 @@
+import { SOURCE, CONFIDENCE } from './snac_input_schema.js';
+ 
+// =============================================================================
+// SNAC Field Intelligence - Phase 4.3
+// snac_regional_variance.js
+// Regional home-range and behavioral variance - SCAFFOLD
+// =============================================================================
+//
+// PURPOSE:
+// Home range and movement vary enormously by region. A blacktail in coastal
+// BC temperate rainforest occupies a far smaller range than one in dry interior
+// habitat. The base HOME_RANGE table in the inference engine uses single fixed
+// numbers per species - this module is where region-specific multipliers live
+// so the engine can scale those numbers by where the tracker actually is.
+//
+// HONEST DESIGN - THIS IS A SCAFFOLD:
+// We do NOT have peer-reviewed regional variance multipliers for every
+// species/biome combination yet. Inventing them would violate the ground-truth
+// rule the whole engine is built on. So this module returns has_data: false
+// until a VALIDATED dataset is injected into REGIONAL_DATA below.
+//
+// When that data exists (peer-reviewed range studies, agency telemetry, or
+// SNAC's own accumulated field data), drop it into REGIONAL_DATA keyed by
+// species then biome, and the engine activates it automatically with ZERO
+// code changes. The wiring, GPS threading, and engine integration are already
+// done - this is purely a fill-in-the-blank.
+//
+// DATA STRUCTURE (ready for injection):
+//   REGIONAL_DATA[speciesKey][biome] = {
+//     home_range_multiplier: Number,   // scales base HOME_RANGE cap
+//     source_note: String,             // citation - REQUIRED, no anonymous data
+//     confidence: CONFIDENCE.*,        // honesty about the data quality
+//   }
+//
+// RULE: never add an entry without a real source_note. If it isn't backed by
+// a citation or validated field data, it does not go in this table.
+//
+// =============================================================================
+ 
+// EMPTY BY DESIGN. Populate only with validated, cited data.
+// Example of the shape a real entry will take (commented out - NOT active data):
+//
+// const REGIONAL_DATA = {
+//   blacktail_deer: {
+//     temperate_rainforest: {
+//       home_range_multiplier: 0.8,
+//       source_note: 'Nyberg & Janz 1990 - coastal BC ranges smaller than interior',
+//       confidence: CONFIDENCE.MEDIUM,
+//     },
+//   },
+// };
+const REGIONAL_DATA = {};
+ 
+// =============================================================================
+// EXPORT
+// =============================================================================
+// Returns regional variance for a species at a biome/location.
+// Until REGIONAL_DATA is populated, always returns has_data: false so the
+// engine falls back to base home range and logs the gap honestly.
+ 
+export function getRegionalVariance(speciesKey, biome, coords = null) {
+  if (!speciesKey || !biome) {
+    return {
+      has_data: false,
+      home_range_multiplier: null,
+      note: 'No species or biome - regional variance not evaluated',
+      source: SOURCE.MISSING,
+      confidence: CONFIDENCE.NONE,
+    };
+  }
+ 
+  const speciesData = REGIONAL_DATA[speciesKey];
+  const entry = speciesData ? speciesData[biome] : null;
+ 
+  if (!entry) {
+    return {
+      has_data: false,
+      home_range_multiplier: null,
+      note: `No validated regional data for ${speciesKey} in ${biome}. Using base home range. This gap will close when a cited dataset is injected.`,
+      source: SOURCE.MISSING,
+      confidence: CONFIDENCE.NONE,
+    };
+  }
+ 
+  // Real data exists - return it. Require a source note or refuse to use it.
+  if (!entry.source_note) {
+    return {
+      has_data: false,
+      home_range_multiplier: null,
+      note: `Regional entry for ${speciesKey}/${biome} has no source citation - rejected per ground-truth rule`,
+      source: SOURCE.MISSING,
+      confidence: CONFIDENCE.NONE,
+    };
+  }
+ 
+  return {
+    has_data: true,
+    home_range_multiplier: entry.home_range_multiplier,
+    note: entry.source_note,
+    source_note: entry.source_note,
+    source: SOURCE.MEASURED,
+    confidence: entry.confidence ?? CONFIDENCE.LOW,
+  };
+}
+ 
+// Helper for future tooling: report what regional data is loaded.
+export function getRegionalCoverage() {
+  const species = Object.keys(REGIONAL_DATA);
+  const entries = species.flatMap(s =>
+    Object.keys(REGIONAL_DATA[s]).map(b => `${s}/${b}`)
+  );
+  return {
+    species_count: species.length,
+    entry_count: entries.length,
+    entries,
+    is_populated: entries.length > 0,
+  };
+}
+ 
+export { REGIONAL_DATA };
+ 

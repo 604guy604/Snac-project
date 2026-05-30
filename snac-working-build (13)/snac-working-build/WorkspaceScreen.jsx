@@ -28,24 +28,21 @@ export default function WorkspaceScreen() {
     clearSession,
   } = useSnac();
 
+  // Try to get GPS. Returns coords on success, null on deny/error.
+  // NEVER blocks analysis - null is a valid result the engine handles.
   const captureGps = useCallback(async () => {
     try {
       const perm = await Location.requestForegroundPermissionsAsync();
       if (!perm.granted) {
-        Alert.alert(
-          'GPS Permission Required',
-          'Allow location access to capture harvest coordinates for weather, habitat, and scent analysis.'
-        );
         return null;
       }
-
       const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
       return {
         latitude: loc.coords.latitude,
         longitude: loc.coords.longitude,
       };
     } catch (err) {
-      Alert.alert('GPS Error', err?.message ?? 'Unable to get location');
+      // GPS hardware off, no fix, timeout - all fall through to null
       return null;
     }
   }, []);
@@ -53,28 +50,40 @@ export default function WorkspaceScreen() {
   const handleAnalyse = useCallback(async () => {
     let harvestGps = inputState?.harvestGps ?? null;
 
+    // Try for GPS if we don't already have it - but don't block on failure
     if (!harvestGps) {
       harvestGps = await captureGps();
-      if (!harvestGps) return;
-      setInputState({
-        ...(inputState ?? {}),
-        harvestGps,
-        harvestTimestamp: new Date().toISOString(),
-      });
+      if (harvestGps) {
+        setInputState({
+          ...(inputState ?? {}),
+          harvestGps,
+          harvestTimestamp: new Date().toISOString(),
+        });
+      }
     }
 
+    // Run analysis whether or not we got GPS.
+    // No GPS = engine skips biome/weather/scent layers and runs on track data.
     const result = await run({
       currentScreenState: {
         ...(inputState ?? {}),
         localHour: new Date().getHours(),
-        harvestGps,
+        harvestGps: harvestGps ?? null,
       },
       huntingPressure: inputState?.huntingPressure ?? 'none',
-      gpsCoords: {
-        lat: harvestGps.latitude,
-        lon: harvestGps.longitude,
-      },
+      gpsCoords: harvestGps
+        ? { lat: harvestGps.latitude, lon: harvestGps.longitude }
+        : null,
     });
+
+    // If GPS was unavailable, let the user know location layers were skipped -
+    // but only after results are ready, so it never blocks the workflow.
+    if (result && !harvestGps) {
+      Alert.alert(
+        'Analysis Complete - No GPS',
+        'Location was unavailable, so weather, habitat, and biome layers were skipped. Track analysis ran on your field data. Enable location for full environmental analysis.'
+      );
+    }
 
     if (result) setView('results');
   }, [run, inputState, setInputState, captureGps]);

@@ -45,6 +45,11 @@ const ZONE_OPTS      = ['riparian_edge','shrub_cover','forest_floor','open_field
 const LIGHT_OPTS     = ['dawn','morning','midday','afternoon','dusk','night'];
 const WEATHER_OPTS   = ['clear','overcast','light_rain','heavy_rain','snow','fog','windy'];
 
+// Phase 4.2 terrain anchor inputs - user-observed ground truth
+const WATER_TYPE_OPTS      = ['none','permanent','ephemeral'];
+const WATER_CONDITION_OPTS = ['clear','churned'];
+const TERRAIN_CHANNEL_OPTS = ['flat','ridge','drainage'];
+
 const SPECIES_GROUPS = [
   { group: 'NORTH AMERICAN DEER', items: [
     { key: 'blacktail_deer',    label: 'Black-tailed Deer' },
@@ -198,6 +203,9 @@ const INIT = {
   nearWater:        false,
   onRidge:          false,
   denseCover:       false,
+  waterType:        '',
+  waterCondition:   '',
+  terrainChannel:   '',
   zoneTag:          '',
   lightPhase:       '',
   weatherCode:      '',
@@ -552,6 +560,11 @@ export default function InputsScreen() {
                   </View>
                 ))}
               </View>
+              <PillRow label="WATER TYPE"  opts={WATER_TYPE_OPTS} selected={s.waterType} onSelect={v => set('waterType', v)} />
+              {s.waterType === 'ephemeral' && (
+                <PillRow label="WATER CONDITION" opts={WATER_CONDITION_OPTS} selected={s.waterCondition} onSelect={v => set('waterCondition', v)} />
+              )}
+              <PillRow label="TERRAIN CHANNEL" opts={TERRAIN_CHANNEL_OPTS} selected={s.terrainChannel} onSelect={v => set('terrainChannel', v)} />
               <PillRow label="ZONE"        opts={ZONE_OPTS}      selected={s.zoneTag}     onSelect={v => set('zoneTag', v)} />
               <PillRow label="LIGHT PHASE" opts={LIGHT_OPTS}     selected={s.lightPhase}  onSelect={v => set('lightPhase', v)} />
               <PillRow label="WEATHER"     opts={WEATHER_OPTS}   selected={s.weatherCode} onSelect={v => set('weatherCode', v)} />
