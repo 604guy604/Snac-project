@@ -39,3 +39,7 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Ignore LILA data prep output and temp files
+/data_prep/lila_out/
+/data_prep/.temp/
