@@ -1,0 +1,16 @@
+{
+  "name": "snac-lila-data-prep",
+  "version": "1.0.0",
+  "description": "SNAC Camera Trap Data Preparation - LILA Dataset Download Pipeline",
+  "type": "module",
+  "main": "lila_download.js",
+  "scripts": {
+    "download:nacti": "node lila_download.js NACTI",
+    "download:all": "node lila_download.js ALL"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "SNAC Wildlife Tracking",
+  "license": "CDLA-Permissive-1.0"
+}
