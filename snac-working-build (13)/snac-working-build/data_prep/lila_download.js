@@ -112,7 +112,7 @@ function mapCategoryToSnac(category, speciesLookup) {
 /**
  * Download ZIP file and extract using tar.exe (Windows 10/11 native)
  */
-async function downloadAndExtractZip(url, tempDir) {
+async function downloadAndExtractZip(url, tempDir, speciesLookup) {
   try {
     // Create temp directory
     if (!fs.existsSync(tempDir)) {
@@ -156,129 +156,33 @@ async function downloadAndExtractZip(url, tempDir) {
         const jsonPath = path.join(tempDir, jsonFile);
         const fileSize = fs.statSync(jsonPath).size;
         console.log(`[EXTRACT] Reading ${jsonFile} (${(fileSize / 1024 / 1024).toFixed(2)} MB)...`);
-        
-        // Use streaming JSON extraction to find categories
-        console.log(`[EXTRACT] Extracting categories from stream...`);
-        
-        const categories = [];
-        let carry = '';
-        let foundCategories = false;
-        let inCategoriesArray = false;
-        let braceCount = 0;
-        let categoryJson = '';
-        let bytesProcessed = 0;
-        const keyToken = '"categories"';
 
-        await new Promise((resolve, reject) => {
-          const stream = fs.createReadStream(jsonPath, {
-            encoding: 'utf8',
-            highWaterMark: 256 * 1024,
-          });
+        const categories = await extractJsonArrayObjectsFromFileToList(jsonPath, 'categories');
+        console.log(`[EXTRACT] Parsed ${categories.length} categories`);
 
-          let chunkCount = 0;
-          let finished = false;
+        const categoryMap = {};
+        for (const cat of categories) {
+          const snacKey = mapCategoryToSnac(cat.name, speciesLookup);
+          if (snacKey) {
+            categoryMap[cat.id] = snacKey;
+          }
+        }
 
-          const processChunk = (chunk) => {
-            const text = carry + chunk;
-            let pos = 0;
+        const {
+          selectedAnnotations,
+          selectedImageIds,
+        } = await extractSelectedAnnotationsFromFile(jsonPath, categoryMap);
 
-            while (pos < text.length && !finished) {
-              if (!foundCategories) {
-                const idx = text.indexOf(keyToken, pos);
-                if (idx === -1) {
-                  carry = text.slice(-Math.min(64, text.length));
-                  return;
-                }
-                foundCategories = true;
-                pos = idx + keyToken.length;
-                continue;
-              }
+        const images = await extractSelectedImagesFromFile(jsonPath, selectedImageIds);
 
-              if (foundCategories && !inCategoriesArray) {
-                while (pos < text.length && /[\s:]/.test(text[pos])) {
-                  pos++;
-                }
-                if (pos < text.length && text[pos] === '[') {
-                  inCategoriesArray = true;
-                  pos++;
-                  continue;
-                }
-                carry = text.slice(-Math.min(64, text.length));
-                return;
-              }
-
-              if (inCategoriesArray) {
-                const ch = text[pos];
-                if (braceCount === 0) {
-                  if (ch === '{') {
-                    braceCount = 1;
-                    categoryJson = '{';
-                  } else if (ch === ']') {
-                    finished = true;
-                    stream.close();
-                    resolve();
-                    return;
-                  }
-                } else {
-                  categoryJson += ch;
-                  if (ch === '{') {
-                    braceCount++;
-                  } else if (ch === '}') {
-                    braceCount--;
-                    if (braceCount === 0) {
-                      try {
-                        const cat = JSON.parse(categoryJson);
-                        if (cat.name) categories.push(cat.name);
-                      } catch (e) {
-                        // skip malformed object
-                      }
-                      categoryJson = '';
-                    }
-                  }
-                }
-                pos++;
-                continue;
-              }
-
-              pos++;
-            }
-
-            carry = finished ? '' : text.slice(-Math.min(64, text.length));
-          };
-
-          stream.on('data', (chunk) => {
-            chunkCount++;
-            bytesProcessed += chunk.length;
-            if (chunkCount % 500 === 0) {
-              const mb = (bytesProcessed / 1024 / 1024).toFixed(0);
-              console.log(`[EXTRACT] Processed ${mb} MB...`);
-            }
-            try {
-              processChunk(chunk);
-            } catch (err) {
-              stream.destroy();
-              reject(err);
-            }
-          });
-
-          stream.on('end', () => {
-            if (!finished) resolve();
-          });
-
-          stream.on('error', reject);
-        });
-
-        console.log(`[EXTRACT] Extracted ${categories.length} categories`);
-        
         // Clean up
         fs.rmSync(zipPath, { force: true });
         fs.rmSync(jsonPath, { force: true });
-        
-        // Return mock metadata with just categories for filtering
+
         return {
-          images: [],
-          categories: categories.map((name, idx) => ({ id: idx, name })),
-          annotations: []
+          categories,
+          images,
+          annotations: selectedAnnotations,
         };
       } else {
         throw new Error(`No JSON file found in extracted files: ${allFiles.join(', ')}`);
@@ -312,17 +216,34 @@ async function downloadAndExtractZip(url, tempDir) {
 
           if (jsonFile) {
             const jsonPath = path.join(tempDir, jsonFile);
-            const jsonContent = fs.readFileSync(jsonPath, 'utf8');
-            const metadata = JSON.parse(jsonContent);
+            const categories = await extractJsonArrayObjectsFromFileToList(jsonPath, 'categories');
+            const categoryMap = {};
+            for (const cat of categories) {
+              const snacKey = mapCategoryToSnac(cat.name, speciesLookup);
+              if (snacKey) {
+                categoryMap[cat.id] = snacKey;
+              }
+            }
+
+            const {
+              selectedAnnotations,
+              selectedImageIds,
+            } = await extractSelectedAnnotationsFromFile(jsonPath, categoryMap);
+
+            const images = await extractSelectedImagesFromFile(jsonPath, selectedImageIds);
 
             // Clean up
             fs.rmSync(zipPath, { force: true });
             fs.rmSync(jsonPath, { force: true });
 
             console.log(
-              `[EXTRACT] Parsed: ${metadata.images?.length ?? 0} images, ${metadata.categories?.length ?? 0} categories`
+              `[EXTRACT] Parsed: ${images.length} images, ${categories.length} categories`
             );
-            return metadata;
+            return {
+              categories,
+              images,
+              annotations: selectedAnnotations,
+            };
           }
         }
       } catch (psErr) {
@@ -337,16 +258,209 @@ async function downloadAndExtractZip(url, tempDir) {
   }
 }
 
+async function extractJsonArrayObjectsFromFile(filePath, keyName, onObject) {
+  const keyToken = Buffer.from(`"${keyName}"`, 'utf8');
+  let carry = Buffer.alloc(0);
+  let foundKey = false;
+  let inArray = false;
+  let braceCount = 0;
+  let inString = false;
+  let escapeNext = false;
+  let objectStart = -1;
+  let finished = false;
+
+  const stream = fs.createReadStream(filePath, {
+    highWaterMark: 256 * 1024,
+  });
+
+  return new Promise((resolve, reject) => {
+    const processBuffer = (buffer) => {
+      let pos = 0;
+
+      while (pos < buffer.length && !finished) {
+        if (!foundKey) {
+          const idx = buffer.indexOf(keyToken, pos);
+          if (idx === -1) {
+            const start = Math.max(0, buffer.length - keyToken.length - 8);
+            carry = Buffer.from(buffer.slice(start));
+            return;
+          }
+          foundKey = true;
+          pos = idx + keyToken.length;
+          continue;
+        }
+
+        if (foundKey && !inArray) {
+          while (pos < buffer.length && /[\s:]/.test(String.fromCharCode(buffer[pos]))) {
+            pos++;
+          }
+          if (pos >= buffer.length) {
+            carry = Buffer.from(buffer.slice(-128));
+            return;
+          }
+          if (buffer[pos] === 0x5b) {
+            inArray = true;
+            pos++;
+            continue;
+          }
+          carry = Buffer.from(buffer.slice(-128));
+          return;
+        }
+
+        if (inArray) {
+          const byte = buffer[pos];
+          if (objectStart < 0) {
+            if (byte === 0x7b) {
+              objectStart = pos;
+              braceCount = 1;
+              inString = false;
+              escapeNext = false;
+            } else if (byte === 0x5d) {
+              finished = true;
+              stream.destroy();
+              resolve();
+              return;
+            }
+            pos++;
+            continue;
+          }
+
+          if (escapeNext) {
+            escapeNext = false;
+            pos++;
+            continue;
+          }
+
+          if (byte === 0x5c) {
+            escapeNext = true;
+            pos++;
+            continue;
+          }
+
+          if (byte === 0x22) {
+            inString = !inString;
+            pos++;
+            continue;
+          }
+
+          if (!inString) {
+            if (byte === 0x7b) {
+              braceCount++;
+            } else if (byte === 0x7d) {
+              braceCount--;
+              if (braceCount === 0) {
+                const objectBytes = Buffer.from(buffer.slice(objectStart, pos + 1));
+                const objectText = objectBytes.toString('utf8');
+                try {
+                  onObject(JSON.parse(objectText));
+                } catch (err) {
+                  // skip malformed object
+                }
+                objectStart = -1;
+              }
+            }
+          }
+          pos++;
+          continue;
+        }
+
+        pos++;
+      }
+
+      if (!finished) {
+        if (objectStart >= 0) {
+          carry = Buffer.from(buffer.slice(objectStart));
+          if (carry.length > 1024 * 1024) {
+            carry = Buffer.from(carry.slice(-1024 * 1024));
+          }
+        } else {
+          carry = Buffer.from(buffer.slice(-128));
+        }
+      }
+    };
+
+    stream.on('data', (chunk) => {
+      const combined = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+      carry = Buffer.alloc(0);
+      try {
+        processBuffer(combined);
+      } catch (err) {
+        stream.destroy();
+        reject(err);
+      }
+    });
+
+    stream.on('end', () => {
+      if (!finished) resolve();
+    });
+
+    stream.on('error', reject);
+  });
+}
+
+async function extractJsonArrayObjectsFromFileToList(filePath, keyName) {
+  const items = [];
+  await extractJsonArrayObjectsFromFile(filePath, keyName, (obj) => items.push(obj));
+  return items;
+}
+
+async function extractSelectedAnnotationsFromFile(filePath, categoryMap) {
+  const selectedAnnotations = [];
+  const selectedImageIds = new Set();
+  const imageSpeciesSeen = new Set();
+  const speciesCounts = {};
+
+  await extractJsonArrayObjectsFromFile(filePath, 'annotations', (ann) => {
+    const snacKey = categoryMap[ann.category_id];
+    if (!snacKey) return;
+
+    const imageSpeciesKey = `${snacKey}::${ann.image_id}`;
+    if (imageSpeciesSeen.has(imageSpeciesKey)) return;
+
+    const count = speciesCounts[snacKey] || 0;
+    if (count >= PER_SPECIES_CAP) return;
+
+    imageSpeciesSeen.add(imageSpeciesKey);
+    speciesCounts[snacKey] = count + 1;
+    selectedImageIds.add(ann.image_id);
+
+    selectedAnnotations.push({
+      image_id: ann.image_id,
+      category_id: ann.category_id,
+      bbox: ann.bbox || null,
+    });
+  });
+
+  return { selectedAnnotations, selectedImageIds };
+}
+
+async function extractSelectedImagesFromFile(filePath, selectedImageIds) {
+  const images = [];
+  if (selectedImageIds.size === 0) return images;
+
+  await extractJsonArrayObjectsFromFile(filePath, 'images', (img) => {
+    if (selectedImageIds.has(img.id)) {
+      images.push({
+        id: img.id,
+        file_name: img.file_name,
+        coco_url: img.coco_url || null,
+      });
+    }
+  });
+
+  return images;
+}
+
 /**
  * Download and decompress ZIP file containing JSON
  * LILA metadata files are often provided as .json.zip for storage efficiency
  */
-async function fetchMetadataZip(url) {
+async function fetchMetadataZip(url, speciesLookup) {
   console.log(`[DOWNLOAD] Fetching compressed metadata: ${url}`);
 
   // Try PowerShell extraction first (best for ZIP files)
   const tempDir = path.join(OUTPUT_BASE, '.temp');
-  const extracted = await downloadAndExtractZip(url, tempDir);
+  const extracted = await downloadAndExtractZip(url, tempDir, speciesLookup);
   if (extracted) return extracted;
 
   // Fallback to native ZIP parsing (slower)
@@ -436,7 +550,7 @@ async function fetchMetadataZip(url) {
   }
 }
 
-async function fetchMetadata(datasetKey) {
+async function fetchMetadata(datasetKey, speciesLookup) {
   const dataset = DATASETS[datasetKey];
   console.log(
     `\n[${datasetKey}] Fetching metadata from ${dataset.metadata_url}`
@@ -455,7 +569,7 @@ async function fetchMetadata(datasetKey) {
       contentType.includes('zip');
 
     if (isZip) {
-      return await fetchMetadataZip(dataset.metadata_url);
+      return await fetchMetadataZip(dataset.metadata_url, speciesLookup);
     }
 
     // Plain JSON
@@ -631,7 +745,7 @@ async function main() {
     console.log(`\n>>> Processing ${datasetKey}: ${dataset.name}`);
 
     // Metadata first
-    const metadata = await fetchMetadata(datasetKey);
+    const metadata = await fetchMetadata(datasetKey, speciesLookup);
     if (!metadata) {
       console.error(`[SKIP] ${datasetKey} - metadata unavailable`);
       continue;
