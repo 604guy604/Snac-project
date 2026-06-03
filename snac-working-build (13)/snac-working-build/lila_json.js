@@ -15,8 +15,14 @@ const DATASETS = {
     metadata_url: 'https://storage.googleapis.com/public-datasets-lila/idaho-camera-traps/idaho-camera-traps.json.zip',
     image_base: 'https://storage.googleapis.com/public-datasets-lila/idaho-camera-traps/public/',
   },
+  wcs: {
+    name: 'WCS Camera Traps',
+    metadata_url: 'https://storage.googleapis.com/public-datasets-lila/wcs/wcs_camera_traps.json.zip',
+    image_base: 'https://storage.googleapis.com/public-datasets-lila/wcs-unzipped/',
+  },
 };
-const TARGET = 'idaho';
+const TARGET = process.argv[2] || 'idaho';
+if(!DATASETS[TARGET]){ console.error('Unknown dataset "' + TARGET + '". Available: ' + Object.keys(DATASETS).join(', ')); process.exit(1); }
 const TEMP_DIR = './data_prep/json_temp/' + TARGET;
 
 const ALIASES = { 'wolf':'gray_wolf', 'ermine':'stoat', 'turkey':'wild_turkey', 'skunk':'striped_skunk', 'badger':'american_badger' };
@@ -118,7 +124,7 @@ async function main(){
   console.log('[CATEGORIES] ' + cats.length + ' total');
   console.log('[MAPPING] ' + Object.keys(catToSnac).length + ' matched:');
   for(const [id,k] of Object.entries(catToSnac)){ const c = cats.find(x=>String(x.id)===String(id)); console.log('  "' + (c?c.name:id) + '" -> ' + k); }
-  console.log('[UNMATCHED] ' + unmatched.length + ': ' + unmatched.join(', '));
+  console.log('[UNMATCHED] ' + unmatched.length + ' (first 60): ' + unmatched.slice(0,60).join(', '));
   if(Object.keys(catToSnac).length===0){ console.log('Nothing matched. Stopping.'); return; }
 
   console.log('[PARSE] Scanning annotations (pass 1)...');
